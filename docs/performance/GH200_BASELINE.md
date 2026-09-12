@@ -210,3 +210,49 @@ The full automated suite reports 21 passing tests. Coverage includes exact
 fused-quantizer parity, proxy head mappings 2:1/4:1/4:2/8:2, approximate
 forward/backward stability, the existing SM90 attention tests, and BF16
 document-mask fallback parity at B=2.
+
+## Portable scheduling and I/O follow-up
+
+The fixed-length SM90 path now applies two ideas shared with the Blackwell
+kernel without depending on Blackwell-only instructions. Commit `d20c1cf`
+replaces edge-oriented partial-output merging with one work item per destination
+query/head group. Commit `29d7c29` replaces scalar gathered-Q traffic with
+layout-aware 128-bit `cp.async` copies into the swizzled shared-memory Q stages.
+
+The merge launch shrank from roughly 921,600 CTAs to 65,536 CTAs in the
+16K/Top-K 2K case. A headless Nsight Systems trace measured its mean kernel time
+at 1.167 ms, down from 2.519 ms (53.7%). The selected-attention kernel retains
+the previously chosen KV-outer reverse-CSR work items and four-CTAs-per-SM
+persistent cap. Sweeping caps of 2, 3, 4, and 6 produced remote-attention
+medians of 2.048, 2.065, 2.035, and 2.037 ms, respectively, so four remains the
+default.
+
+CUDA-event results below use the normal fixed-length BF16 path. JIT compilation
+is excluded. The 16K/2K result uses five warmups and twenty measurements; the
+other long-context cases use three warmups and ten measurements.
+
+| Shape | Top-K | Before full forward | Final full forward | Speedup | Final remote attention |
+|---:|---:|---:|---:|---:|---:|
+| 16K | 2048 | 8.870 ms | 6.434 ms | 27.5% | 2.035 ms |
+| 16K | 4096 | 15.150 ms | 10.782 ms | 28.8% | 3.667 ms |
+| 32K | 2048 | 18.668 ms | 13.518 ms | 27.6% | 3.912 ms |
+
+The focused benchmark command is:
+
+```bash
+python benchmarks/profile_bf16_io.py \
+  --sequence-length 32768 --top-k 2048 --warmup 3 --repeats 10
+```
+
+An autograd-enabled 16K/Top-K 2K run with five warmups and twenty measurements
+reported a 6.519 ms forward median and a 23.411 ms backward median. The
+backward implementation is unchanged, so the backward number is a regression
+guard rather than an optimization claim. All 27 focused tests are accounted for:
+six FP8-storage/mixed-path tests, twelve persistent-scheduler/native-forward
+tests, and nine proxy-selection/training tests.
+
+These optimizations currently accelerate the fixed-length normal path. The
+document-masked/varlen fallback still passes its regression gates but does not
+yet use the destination-centric merge or native SM90 gathered-Q pipeline. Its
+port must retain segment predicates and explicit batch-row boundaries for
+partial document tiles.

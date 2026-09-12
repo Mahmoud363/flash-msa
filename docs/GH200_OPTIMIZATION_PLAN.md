@@ -149,6 +149,38 @@ for BF16. End-to-end fixed-length forward improves by 3.0% at 16K and 6.1% at
 document-masked path retains exact BF16 selection until the later varlen port.
 Detailed evidence is in `docs/performance/GH200_BASELINE.md`.
 
+## Portable scheduling and I/O follow-up (fixed-length complete)
+
+The Blackwell design's scheduling and data-movement principles are useful on
+GH200 even though its TCGen05, TMEM, and Cluster Launch Control mechanisms are
+not. Two SM90 implementations were retained:
+
+1. The online merge is destination-centric. One CTA gathers all reverse-CSR
+   partials for a destination query/head group, forms the multi-edge
+   log-sum-exp weights in shared memory, and reads/writes each FP32 output
+   element once. This replaces an edge-sized launch in which most CTAs returned
+   after a slot scan and surviving CTAs repeatedly round-tripped output through
+   global memory.
+2. Arbitrary CSR query tiles are gathered with layout-aware 128-bit
+   `cp.async` copies into the existing swizzled shared-memory Q stages. The copy
+   partition is derived from the destination layout, so this is valid for BF16
+   and E4M3 tiles without assuming that logical rows are physically contiguous.
+
+The retained persistent limit remains four CTAs per SM. A 2/3/4/6-CTA sweep at
+16K/Top-K 2K showed no benefit from changing it. Headless Nsight Systems measured
+the merge at 1.167 ms versus 2.519 ms before the destination-centric rewrite.
+The final BF16 normal-path measurements are 6.434 ms at 16K/Top-K 2K,
+10.782 ms at 16K/Top-K 4K, and 13.518 ms at 32K/Top-K 2K. These are
+27.5%, 28.8%, and 27.6% faster than the corresponding pre-follow-up results.
+
+This work changes forward scheduling and I/O only. The existing backward kernel
+and arithmetic are unchanged; a 16K/Top-K 2K training run measured 6.519 ms
+forward and 23.411 ms backward. The fixed-length correctness suite accounts for
+27 passing tests, including forward/backward numerical gates. The later varlen
+port must make destination IDs segment-aware, predicate partial first/last
+document tiles, and preserve batch-row boundaries while reusing the same
+destination-gather and layout-partitioned-copy structure.
+
 ## Milestone 4: FP8 KV storage with BF16 compute
 
 Store K/V as E4M3, load through TMA, and convert into BF16 shared-memory layouts
