@@ -206,6 +206,15 @@ paths; document segments add only destination decoding and key-boundary
 predication. TMA alone measured 21.937 ms and was not retained as an isolated
 optimization—the wide gathered Q/dO loads are essential to the result.
 
+The optimized main backward is production-dispatched when the SM90 forward is
+selected and the proxy-KL output is not part of the loss. PyTorch gradient
+materialization is disabled so an unused KL output reaches the custom backward
+as `None`, avoiding proxy LSE recomputation and the legacy fused launch. In
+matched end-to-end B=1, S=16K, Top-K=2K runs, normal-path backward falls from
+16.929 ms to 8.866 ms (47.6%); with 32 uneven documents it falls from 6.743 ms
+to 3.430 ms (49.1%). The KL-enabled path intentionally remains on the legacy
+kernel until native proxy-gradient fusion is complete.
+
 ## Milestone 4: FP8 KV storage with BF16 compute
 
 Store K/V as E4M3, load through TMA, and convert into BF16 shared-memory layouts

@@ -3,6 +3,7 @@
 import pytest
 import torch
 
+from flash_msa import flash_msa_func
 from flash_msa.msa_backward_sm90 import (
     wgmma_backward_attention_tile,
     wgmma_backward_dq,
@@ -167,3 +168,36 @@ def test_segmented_remote_metadata_is_canonical_reverse_csr() -> None:
     )
     offsets = schedule.task_offsets[: schedule.num_tasks + 1]
     assert bool((offsets[1:] >= offsets[:-1]).all())
+
+
+def test_autograd_dispatches_sm90_main_backward(monkeypatch) -> None:
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (9, 0):
+        pytest.skip("SM90 test")
+    monkeypatch.setenv("MSA_FORWARD_BACKEND", "sm90")
+    monkeypatch.setenv("MSA_SELECT_BACKEND", "bf16")
+    monkeypatch.setenv("MSA_KV_STORAGE", "bf16")
+    torch.manual_seed(251)
+    shapes = ((1, 4, 512, 128), (1, 1, 512, 128),
+              (1, 16, 512, 128), (1, 2, 512, 128), (1, 2, 512, 128))
+    values = [torch.randn(shape, device="cuda", dtype=torch.bfloat16) for shape in shapes]
+    grad_output = torch.randn(1, 512, 16 * 128, device="cuda")
+
+    inputs = [value.detach().clone().requires_grad_(True) for value in values]
+    output, _unused_kl = flash_msa_func(*inputs, 256, 128**-0.5)
+    loss = (output.float() * grad_output).sum()
+    monkeypatch.setenv("MSA_BACKWARD_BACKEND", "sm90")
+    loss.backward(retain_graph=True)
+    native_grads = tuple(item.grad.detach().clone() for item in inputs)
+    for item in inputs:
+        item.grad = None
+    monkeypatch.setenv("MSA_BACKWARD_BACKEND", "legacy")
+    loss.backward()
+    legacy_grads = tuple(item.grad.detach() for item in inputs)
+    for index, (native, legacy) in enumerate(zip(native_grads, legacy_grads)):
+        if index < 2:
+            torch.testing.assert_close(native, legacy, rtol=0, atol=0)
+        else:
+            cosine = torch.nn.functional.cosine_similarity(
+                native.float().flatten(), legacy.float().flatten(), dim=0
+            )
+            assert float(cosine) >= 0.999

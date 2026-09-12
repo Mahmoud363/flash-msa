@@ -10,6 +10,7 @@ import torch
 from flash_msa.msa_kv_fp8 import MixedFP8QKV
 from flash_msa.msa_select_cutedsl import compute_proxy_lse, select_blocks
 from flash_msa.msa_backward_cutedsl import run_fused_backward
+from flash_msa.msa_backward_sm90 import wgmma_kv_row_backward_main
 from flash_msa.msa_forward_cutedsl import run_main_forward
 from flash_msa.reverse_index_cuda import (
     DocumentSegmentMetadata,
@@ -96,14 +97,47 @@ def _run_fused_selected_edge_backward(
             "NATIVE_MMA_ROWS_PER_TASK evenly"
         )
 
+    delta_main = (o_main.float() * grad_o_main.float()).sum(dim=-1)
+    backward_backend = os.environ.get(
+        "MSA_BACKWARD_BACKEND",
+        "sm90" if os.environ.get("MSA_FORWARD_BACKEND", "fa3").lower() == "sm90" else "legacy",
+    ).lower()
+    if backward_backend not in ("legacy", "sm90"):
+        raise ValueError("MSA_BACKWARD_BACKEND must be 'legacy' or 'sm90'")
+    if backward_backend == "sm90" and grad_kl is None:
+        schedule = metadata.kv_outer_schedule
+        if schedule is None:
+            raise RuntimeError("SM90 backward requires the saved KV-outer schedule")
+        segments = metadata.document_segments
+        dq, dk, dv = wgmma_kv_row_backward_main(
+            q,
+            k,
+            v,
+            grad_o_main,
+            lse_main,
+            delta_main,
+            schedule.row_ptr,
+            schedule.query_indices[: schedule.num_edges],
+            n_proxy_heads=int(n_proxy_heads),
+            scale=float(scale),
+            segment_starts=None if segments is None else segments.starts,
+            segment_lengths=None if segments is None else segments.lengths,
+            segment_batches=None if segments is None else segments.batches,
+        )
+        return (
+            torch.zeros_like(q_proxy),
+            torch.zeros_like(k_proxy),
+            dq.to(q.dtype),
+            dk.to(k.dtype),
+            dv.to(v.dtype),
+        )
+
     lse_proxy = compute_proxy_lse(
         q_proxy,
         k_proxy,
         scale=float(scale),
         metadata=metadata,
     )
-
-    delta_main = (o_main.float() * grad_o_main.float()).sum(dim=-1)
     # Proxy KL gradients are linear in the upstream scalar.  Run the native
     # kernel at the static normalization scale, then apply the CUDA scalar to
     # only the proxy gradients.  This avoids the synchronizing ``.item()`` that
@@ -149,6 +183,7 @@ class _SparseAttentionFunction(torch.autograd.Function):
         cu_seqlens: torch.Tensor | None,
         prequantized_qkv: MixedFP8QKV | None,
     ):
+        ctx.set_materialize_grads(False)
         b, n_proxy_heads, s, head_dim = q_proxy.shape
         n_heads = q.shape[1]
         n_kv_heads = k.shape[1]
