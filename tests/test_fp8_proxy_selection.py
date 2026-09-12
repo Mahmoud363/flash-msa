@@ -3,6 +3,7 @@
 import pytest
 import torch
 
+from flash_msa import flash_msa_func
 from flash_msa.msa_select_fp8 import (
     dequantize_proxy_e4m3,
     dequantize_proxy_e4m3_per_block,
@@ -109,3 +110,40 @@ def test_fused_cutedsl_quantizer_matches_reference_policy() -> None:
     torch.testing.assert_close(
         actual_q.float(), expected_q.float(), rtol=0, atol=0
     )
+
+
+def test_fp8_training_step_meets_approximate_stability_gates(monkeypatch) -> None:
+    _require_sm90()
+    torch.manual_seed(89)
+
+    def tensor(heads: int) -> torch.Tensor:
+        return torch.randn(1, heads, 1024, 128, device="cuda", dtype=torch.bfloat16)
+
+    inputs = (tensor(4), tensor(1), tensor(16), tensor(2), tensor(2))
+
+    def run(backend: str):
+        monkeypatch.setenv("MSA_FORWARD_BACKEND", "sm90")
+        monkeypatch.setenv("MSA_SELECT_BACKEND", backend)
+        values = tuple(value.clone().requires_grad_(True) for value in inputs)
+        output, kl_loss = flash_msa_func(*values, 512, 128**-0.5)
+        loss = output.float().square().mean() + kl_loss.float()
+        gradients = torch.autograd.grad(loss, values)
+        return output, loss, gradients
+
+    reference_output, reference_loss, reference_gradients = run("bf16")
+    fp8_output, fp8_loss, fp8_gradients = run("fp8")
+    assert bool(torch.isfinite(fp8_output).all())
+    assert bool(torch.isfinite(fp8_loss))
+    assert all(bool(torch.isfinite(gradient).all()) for gradient in fp8_gradients)
+
+    output_cosine = torch.nn.functional.cosine_similarity(
+        reference_output.float().reshape(1, -1), fp8_output.float().reshape(1, -1)
+    )
+    loss_error = (fp8_loss - reference_loss).abs() / reference_loss.abs().clamp_min(1e-20)
+    assert float(output_cosine.detach()) >= 0.97
+    assert float(loss_error.detach()) <= 0.01
+    for reference, candidate in zip(reference_gradients, fp8_gradients):
+        gradient_cosine = torch.nn.functional.cosine_similarity(
+            reference.float().reshape(1, -1), candidate.float().reshape(1, -1)
+        )
+        assert float(gradient_cosine.detach()) >= 0.99
