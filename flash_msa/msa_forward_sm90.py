@@ -461,16 +461,48 @@ class _SelectedQKWgmmaKernel:
                 acc_mn[row, col] *= inv_sum
         return row_max, row_sum
 
+    @staticmethod
+    def _convert_c_layout_to_a_layout(c_layout, a_layout):
+        return cute.make_layout(
+            (
+                a_layout,
+                c_layout.shape[1],
+                (c_layout.shape[2], cute.size(c_layout, mode=[0]) // cute.size(a_layout)),
+            ),
+            stride=(
+                c_layout.stride[0],
+                c_layout.stride[1],
+                (
+                    c_layout.stride[2],
+                    cute.size(a_layout, mode=[2]) * c_layout.stride[0][2],
+                ),
+            ),
+        )
+
+    @cute.jit
+    def _accumulator_to_operand(self, accumulator, operand_layout_tv):
+        operand = cute.make_rmem_tensor_like(
+            self._convert_c_layout_to_a_layout(
+                accumulator.layout, operand_layout_tv.shape[1]
+            ),
+            self._dtype,
+        )
+        operand_as_accumulator = cute.make_tensor(operand.iterator, accumulator.layout)
+        operand_as_accumulator.store(accumulator.load().to(self._dtype))
+        return operand
+
     @cute.jit
     def __call__(
         self,
         q: cute.Tensor,
         k: cute.Tensor,
+        v: cute.Tensor,
         task_meta: cute.Tensor,
         query_indices: cute.Tensor,
         scores: cute.Tensor,
         probabilities: cute.Tensor,
         lse: cute.Tensor,
+        output: cute.Tensor,
         scale: cutlass.Float32,
         stream: cuda.CUstream,
     ):
@@ -496,9 +528,20 @@ class _SelectedQKWgmmaKernel:
         )
         q = cute.make_tensor(q.iterator, q_layout)
         k = cute.make_tensor(k.iterator, kv_layout)
+        v_layout = cute.make_layout(
+            (head_dim, seq_len, n_kv_heads, batch),
+            stride=(
+                1,
+                head_dim,
+                seq_len * head_dim,
+                n_kv_heads * seq_len * head_dim,
+            ),
+        )
+        v = cute.make_tensor(v.iterator, v_layout)
         dtype = q.element_type
         q_layout_enum = utils.LayoutEnum.from_tensor(q)
         k_layout_enum = utils.LayoutEnum.from_tensor(k)
+        v_layout_enum = utils.LayoutEnum.from_tensor(v)
         tiled_mma = sm90_utils.make_trivial_tiled_mma(
             dtype,
             dtype,
@@ -508,11 +551,24 @@ class _SelectedQKWgmmaKernel:
             (1, 1, 1),
             (self.rows, self.block),
         )
+        pv_tiled_mma = sm90_utils.make_trivial_tiled_mma(
+            dtype,
+            dtype,
+            warpgroup.OperandMajorMode.K,
+            v_layout_enum.sm90_mma_major_mode(),
+            cutlass.Float32,
+            (1, 1, 1),
+            (self.rows, self.block),
+            warpgroup.OperandSource.RMEM,
+        )
         q_smem_staged = sm90_utils.make_smem_layout_a(
             q_layout_enum, (self.rows, self.block, head_dim), dtype, 1
         )
         k_smem_staged = sm90_utils.make_smem_layout_b(
             k_layout_enum, (self.rows, self.block, head_dim), dtype, 1
+        )
+        v_smem_staged = sm90_utils.make_smem_layout_b(
+            v_layout_enum, (self.rows, self.block, self.block), dtype, 1
         )
         k_smem = cute.slice_(k_smem_staged, (None, None, 0))
         tma_k, tensor_k = cute.nvgpu.cpasync.make_tiled_tma_atom(
@@ -521,17 +577,28 @@ class _SelectedQKWgmmaKernel:
             k_smem,
             (self.block, head_dim),
         )
+        v_smem = cute.slice_(v_smem_staged, (None, None, 0))
+        tma_v, tensor_v = cute.nvgpu.cpasync.make_tiled_tma_atom(
+            cute.nvgpu.cpasync.CopyBulkTensorTileG2SOp(),
+            v,
+            v_smem,
+            (self.block, self.block),
+        )
         self._dtype = dtype
         self._tma_bytes = cute.size_in_bytes(dtype, k_smem)
 
         @cute.struct
         class SharedStorage:
             k_barriers: cute.struct.MemRange[cutlass.Int64, 2]
+            v_barriers: cute.struct.MemRange[cutlass.Int64, 2]
             sQ: cute.struct.Align[
                 cute.struct.MemRange[dtype, cute.cosize(q_smem_staged)], 1024
             ]
             sK: cute.struct.Align[
                 cute.struct.MemRange[dtype, cute.cosize(k_smem_staged)], 1024
+            ]
+            sV: cute.struct.Align[
+                cute.struct.MemRange[dtype, cute.cosize(v_smem_staged)], 1024
             ]
 
         self.shared_storage = SharedStorage
@@ -539,16 +606,21 @@ class _SelectedQKWgmmaKernel:
             q,
             tma_k,
             tensor_k,
+            tma_v,
+            tensor_v,
             task_meta,
             query_indices,
             scores,
             probabilities,
             lse,
+            output,
             scale * cutlass.Float32(1.4426950408889634),
             scale,
             tiled_mma,
+            pv_tiled_mma,
             q_smem_staged,
             k_smem_staged,
+            v_smem_staged,
         ).launch(
             grid=[self.num_tasks, 1, 1],
             block=[256, 1, 1],
@@ -562,16 +634,21 @@ class _SelectedQKWgmmaKernel:
         q: cute.Tensor,
         tma_k: cute.CopyAtom,
         k: cute.Tensor,
+        tma_v: cute.CopyAtom,
+        v: cute.Tensor,
         task_meta: cute.Tensor,
         query_indices: cute.Tensor,
         scores: cute.Tensor,
         probabilities: cute.Tensor,
         lse: cute.Tensor,
+        output: cute.Tensor,
         scale_log2: cutlass.Float32,
         scale: cutlass.Float32,
         tiled_mma: cute.TiledMma,
+        pv_tiled_mma: cute.TiledMma,
         q_smem_staged: cute.ComposedLayout,
         k_smem_staged: cute.ComposedLayout,
+        v_smem_staged: cute.ComposedLayout,
     ):
         tidx, _, _ = cute.arch.thread_idx()
         task_idx, _, _ = cute.arch.block_idx()
@@ -586,10 +663,20 @@ class _SelectedQKWgmmaKernel:
         sK = storage.sK.get_tensor(
             k_smem_staged.outer, swizzle=k_smem_staged.inner
         )
+        sV = storage.sV.get_tensor(
+            v_smem_staged.outer, swizzle=v_smem_staged.inner
+        )
         producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
         consumer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread, 4)
         k_pipe = pipeline.PipelineTmaAsync.create(
             barrier_storage=storage.k_barriers.data_ptr(),
+            num_stages=1,
+            producer_group=producer_group,
+            consumer_group=consumer_group,
+            tx_count=self._tma_bytes,
+        )
+        v_pipe = pipeline.PipelineTmaAsync.create(
+            barrier_storage=storage.v_barriers.data_ptr(),
             num_stages=1,
             producer_group=producer_group,
             consumer_group=consumer_group,
@@ -615,10 +702,28 @@ class _SelectedQKWgmmaKernel:
             cute.group_modes(sK, 0, 2),
             cute.group_modes(gK, 0, 2),
         )
+        gV = cute.local_tile(
+            v[None, None, kv_head, batch],
+            (self.block, self.block),
+            (0, None),
+        )
+        tVsV, tVgV = cute.nvgpu.cpasync.tma_partition(
+            tma_v,
+            0,
+            cute.make_layout(1),
+            cute.group_modes(sV, 0, 2),
+            cute.group_modes(gV, 0, 2),
+        )
         producer_state = pipeline.make_pipeline_state(
             pipeline.PipelineUserType.Producer, 1
         )
         consumer_state = pipeline.make_pipeline_state(
+            pipeline.PipelineUserType.Consumer, 1
+        )
+        v_producer_state = pipeline.make_pipeline_state(
+            pipeline.PipelineUserType.Producer, 1
+        )
+        v_consumer_state = pipeline.make_pipeline_state(
             pipeline.PipelineUserType.Consumer, 1
         )
 
@@ -631,6 +736,14 @@ class _SelectedQKWgmmaKernel:
                 tma_bar_ptr=k_pipe.producer_get_barrier(producer_state),
             )
             k_pipe.producer_commit(producer_state)
+            v_pipe.producer_acquire(v_producer_state)
+            cute.copy(
+                tma_v,
+                tVgV[(None, key_block)],
+                tVsV[(None, 0)],
+                tma_bar_ptr=v_pipe.producer_get_barrier(v_producer_state),
+            )
+            v_pipe.producer_commit(v_producer_state)
 
         # Producer warpgroup gathers arbitrary CSR query IDs into the WGMMA
         # shared-memory A layout while the TMA engine transfers K.
@@ -693,6 +806,29 @@ class _SelectedQKWgmmaKernel:
                         row_max[row] * scale + _math.log(row_sum[row])
                     )
 
+            v_pipe.consumer_wait(v_consumer_state)
+            pv_thr_mma = pv_tiled_mma.get_slice(wg_thread)
+            tOsV = pv_thr_mma.partition_B(sV)
+            tOrV = pv_thr_mma.make_fragment_B(tOsV)
+            probability_operand = self._accumulator_to_operand(
+                acc, pv_tiled_mma.tv_layout_A
+            )
+            output_shape = pv_thr_mma.partition_shape_C((self.rows, self.block))
+            output_accumulator = pv_thr_mma.make_fragment_C(output_shape)
+            cute.nvgpu.warpgroup.fence()
+            self._gemm_zero(
+                pv_tiled_mma,
+                probability_operand,
+                tOrV[(None, None, None, 0)],
+                output_accumulator,
+            )
+            cute.nvgpu.warpgroup.commit_group()
+            cute.nvgpu.warpgroup.wait_group(0)
+            g_output = output[task_idx, None, None]
+            tOg = pv_thr_mma.partition_C(g_output)
+            for i in cutlass.range_constexpr(cute.size(output_accumulator)):
+                tOg[i] = self._dtype(output_accumulator[i])
+
 
 def wgmma_selected_qk(
     q: torch.Tensor,
@@ -720,6 +856,7 @@ def wgmma_selected_qk(
     scores = torch.empty((num_tasks, 64, 128), device=q.device, dtype=torch.float32)
     probabilities = torch.empty_like(scores)
     lse = torch.empty((num_tasks, 64), device=q.device, dtype=torch.float32)
+    output = torch.empty((num_tasks, 64, 128), device=q.device, dtype=q.dtype)
     if num_tasks == 0:
         return scores
     q_cute = _to_cute_tensor(q.detach().contiguous())
@@ -739,22 +876,26 @@ def wgmma_selected_qk(
             kernel,
             q_cute,
             k_cute,
+            k_cute,
             meta_cute,
             qids_cute,
             scores_cute,
             probabilities_cute,
             lse_cute,
+            _to_cute_tensor(output),
             1.0,
             stream,
         )
     _COMPILE_CACHE[key](
         q_cute,
         k_cute,
+        k_cute,
         meta_cute,
         qids_cute,
         scores_cute,
         probabilities_cute,
         lse_cute,
+        _to_cute_tensor(output),
         1.0,
         stream,
     )
@@ -776,6 +917,7 @@ def wgmma_selected_softmax(
     scores = torch.empty((num_tasks, 64, 128), device=q.device, dtype=torch.float32)
     probabilities = torch.empty_like(scores)
     lse = torch.empty((num_tasks, 64), device=q.device, dtype=torch.float32)
+    output = torch.empty((num_tasks, 64, 128), device=q.device, dtype=q.dtype)
     if num_tasks == 0:
         return probabilities, lse
     q_cute = _to_cute_tensor(q.detach().contiguous())
@@ -795,26 +937,96 @@ def wgmma_selected_softmax(
             kernel,
             q_cute,
             k_cute,
+            k_cute,
             meta_cute,
             qids_cute,
             scores_cute,
             probabilities_cute,
             lse_cute,
+            _to_cute_tensor(output),
             float(scale),
             stream,
         )
     _COMPILE_CACHE[key](
         q_cute,
         k_cute,
+        k_cute,
         meta_cute,
         qids_cute,
         scores_cute,
         probabilities_cute,
         lse_cute,
+        _to_cute_tensor(output),
         float(scale),
         stream,
     )
     return probabilities, lse
+
+
+def wgmma_selected_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    task_meta: torch.Tensor,
+    query_indices: torch.Tensor,
+    *,
+    n_proxy_heads: int,
+    scale: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return BF16/FP16 partial output and FP32 LSE for selected KV tasks."""
+
+    if k.shape != v.shape or q.dtype != k.dtype or k.dtype != v.dtype:
+        raise ValueError("K/V shapes and Q/K/V dtypes must match")
+    num_tasks = int(task_meta.shape[0])
+    scores = torch.empty((num_tasks, 64, 128), device=q.device, dtype=torch.float32)
+    probabilities = torch.empty_like(scores)
+    lse = torch.empty((num_tasks, 64), device=q.device, dtype=torch.float32)
+    output = torch.empty((num_tasks, 64, 128), device=q.device, dtype=q.dtype)
+    if num_tasks == 0:
+        return output, lse
+    q_cute = _to_cute_tensor(q.detach().contiguous())
+    k_cute = _to_cute_tensor(k.detach().contiguous())
+    v_cute = _to_cute_tensor(v.detach().contiguous())
+    meta_cute = _to_cute_tensor(task_meta.contiguous())
+    qids_cute = _to_cute_tensor(query_indices.contiguous())
+    scores_cute = _to_cute_tensor(scores)
+    probabilities_cute = _to_cute_tensor(probabilities)
+    lse_cute = _to_cute_tensor(lse)
+    output_cute = _to_cute_tensor(output)
+    stream = cuda.CUstream(torch.cuda.current_stream(q.device).cuda_stream)
+    main_per_proxy = int(q.shape[1]) // int(n_proxy_heads)
+    proxy_per_kv = int(n_proxy_heads) // int(k.shape[1])
+    key = ("selected_qk_wgmma", num_tasks, main_per_proxy, proxy_per_kv, q_cute.element_type)
+    if key not in _COMPILE_CACHE:
+        kernel = _SelectedQKWgmmaKernel(num_tasks, main_per_proxy, proxy_per_kv)
+        _COMPILE_CACHE[key] = cute.compile(
+            kernel,
+            q_cute,
+            k_cute,
+            v_cute,
+            meta_cute,
+            qids_cute,
+            scores_cute,
+            probabilities_cute,
+            lse_cute,
+            output_cute,
+            float(scale),
+            stream,
+        )
+    _COMPILE_CACHE[key](
+        q_cute,
+        k_cute,
+        v_cute,
+        meta_cute,
+        qids_cute,
+        scores_cute,
+        probabilities_cute,
+        lse_cute,
+        output_cute,
+        float(scale),
+        stream,
+    )
+    return output, lse
 
 
 __all__ = [
@@ -822,4 +1034,5 @@ __all__ = [
     "tma_load_selected_kv",
     "wgmma_selected_qk",
     "wgmma_selected_softmax",
+    "wgmma_selected_attention",
 ]
