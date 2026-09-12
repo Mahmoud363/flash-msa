@@ -212,8 +212,21 @@ materialization is disabled so an unused KL output reaches the custom backward
 as `None`, avoiding proxy LSE recomputation and the legacy fused launch. In
 matched end-to-end B=1, S=16K, Top-K=2K runs, normal-path backward falls from
 16.929 ms to 8.866 ms (47.6%); with 32 uneven documents it falls from 6.743 ms
-to 3.430 ms (49.1%). The KL-enabled path intentionally remains on the legacy
-kernel until native proxy-gradient fusion is complete.
+to 3.430 ms (49.1%).
+
+The KL-enabled path now composes the optimized KV-outer main backward with a
+specialized proxy-only launch of the existing selected-edge kernel. The
+specialization removes the main dQ/dK/dV shared-memory stages, tensor products,
+and output allocations while retaining the proxy-Q/K KL calculation and its
+upstream-scalar handling. Focused fixed and uneven-document tests compare all
+five gradients against the legacy fused kernel.
+
+On GH200 at B=1, S=16K, Top-K=2K, seven-repeat production-autograd medians are
+22.726 ms for the original fused KL backward and 19.045 ms for the composed
+SM90 path (16.2% faster). With 32 reproducible uneven documents, the medians are
+8.490 ms and 7.107 ms (16.3% faster). This is smaller than the main-only gain
+because proxy Q/K gradients still use a second edge-oriented launch; folding
+them into the resident KV work item remains the final Milestone 6 optimization.
 
 ## Milestone 4: FP8 KV storage with BF16 compute
 

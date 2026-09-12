@@ -711,5 +711,7 @@ def compute_proxy_lse(
         metadata=metadata,
         scale=float(scale),
         return_output=False,
+        # Main-attention FP8 storage does not apply to the BF16 proxy branch.
+        kv_storage_override="bf16",
     )
     return lse_proxy

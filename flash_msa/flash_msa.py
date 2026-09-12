@@ -145,6 +145,52 @@ def _run_fused_selected_edge_backward(
     proxy_grad_scale = (
         0.0 if grad_kl is None else 1.0 / float(bsz * n_proxy_heads * seq_len)
     )
+    if backward_backend == "sm90":
+        schedule = metadata.kv_outer_schedule
+        assert schedule is not None and grad_kl is not None
+        segments = metadata.document_segments
+        dq, dk, dv = wgmma_kv_row_backward_main(
+            q,
+            k,
+            v,
+            grad_o_main,
+            lse_main,
+            delta_main,
+            schedule.row_ptr,
+            schedule.query_indices[: schedule.num_edges],
+            n_proxy_heads=int(n_proxy_heads),
+            scale=float(scale),
+            segment_starts=None if segments is None else segments.starts,
+            segment_lengths=None if segments is None else segments.lengths,
+            segment_batches=None if segments is None else segments.batches,
+        )
+        dq_proxy, dk_proxy, *_unused_main = run_fused_backward(
+            q_proxy,
+            k_proxy,
+            q,
+            k,
+            v,
+            grad_o_main,
+            lse_main,
+            lse_proxy,
+            delta_main,
+            metadata.task_meta,
+            metadata.task_qids,
+            scale=float(scale),
+            grad_kl_scale=proxy_grad_scale,
+            document_segments=metadata.document_segments,
+            proxy_only=True,
+        )
+        proxy_multiplier = grad_kl.detach().to(
+            device=q.device, dtype=dq_proxy.dtype
+        )
+        return (
+            dq_proxy * proxy_multiplier,
+            dk_proxy * proxy_multiplier.to(dtype=dk_proxy.dtype),
+            dq.to(q.dtype),
+            dk.to(k.dtype),
+            dv.to(v.dtype),
+        )
     dq_proxy, dk_proxy, dq, dk, dv = run_fused_backward(
         q_proxy,
         k_proxy,

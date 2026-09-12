@@ -201,3 +201,47 @@ def test_autograd_dispatches_sm90_main_backward(monkeypatch) -> None:
                 native.float().flatten(), legacy.float().flatten(), dim=0
             )
             assert float(cosine) >= 0.999
+
+
+@pytest.mark.parametrize("document_masking", [False, True])
+def test_autograd_sm90_composes_main_and_proxy_backward(
+    monkeypatch, document_masking: bool
+) -> None:
+    """The optimized main kernel composes with KL-only proxy gradients."""
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (9, 0):
+        pytest.skip("SM90 test")
+    monkeypatch.setenv("MSA_FORWARD_BACKEND", "sm90")
+    monkeypatch.setenv("MSA_SELECT_BACKEND", "bf16")
+    monkeypatch.setenv("MSA_KV_STORAGE", "bf16")
+    torch.manual_seed(257 + int(document_masking))
+    shapes = ((1, 4, 512, 128), (1, 1, 512, 128),
+              (1, 16, 512, 128), (1, 2, 512, 128), (1, 2, 512, 128))
+    inputs = [
+        torch.randn(shape, device="cuda", dtype=torch.bfloat16).requires_grad_(True)
+        for shape in shapes
+    ]
+    grad_output = torch.randn(1, 512, 16 * 128, device="cuda")
+    documents = None
+    if document_masking:
+        documents = torch.empty(1, 512, device="cuda", dtype=torch.int32)
+        documents[0, :93], documents[0, 93:287], documents[0, 287:] = 0, 1, 2
+
+    output, kl_loss = flash_msa_func(
+        *inputs, 256, 128**-0.5, document_list=documents
+    )
+    loss = (output.float() * grad_output).sum() + 1.7 * kl_loss.float()
+    monkeypatch.setenv("MSA_BACKWARD_BACKEND", "sm90")
+    loss.backward(retain_graph=True)
+    native_grads = tuple(item.grad.detach().clone() for item in inputs)
+    for item in inputs:
+        item.grad = None
+    monkeypatch.setenv("MSA_BACKWARD_BACKEND", "legacy")
+    loss.backward()
+    legacy_grads = tuple(item.grad.detach() for item in inputs)
+
+    for native, legacy in zip(native_grads, legacy_grads):
+        cosine = torch.nn.functional.cosine_similarity(
+            native.float().flatten(), legacy.float().flatten(), dim=0
+        )
+        assert float(cosine) >= 0.999
+        torch.testing.assert_close(native, legacy, rtol=2e-2, atol=2e-2)

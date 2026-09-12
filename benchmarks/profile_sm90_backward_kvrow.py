@@ -36,6 +36,7 @@ def main() -> None:
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--repeats", type=int, default=5)
     parser.add_argument("--check", action="store_true")
+    parser.add_argument("--baseline-proxy-only", action="store_true")
     parser.add_argument("--documents-per-row", type=int, default=0)
     args = parser.parse_args()
     torch.manual_seed(241)
@@ -84,8 +85,12 @@ def main() -> None:
         return run_fused_backward(
             qp, kp, q, k, v, do, lse, lse_proxy, delta,
             metadata.task_meta, metadata.task_qids,
-            scale=scale, grad_kl_scale=0.0,
+            scale=scale,
+            grad_kl_scale=(
+                1.0 / (b * hp * s) if args.baseline_proxy_only else 0.0
+            ),
             document_segments=document_segments,
+            proxy_only=args.baseline_proxy_only,
         )[2:]
 
     for _ in range(args.warmup):

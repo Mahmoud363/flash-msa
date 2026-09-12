@@ -149,6 +149,7 @@ def sparse_flash_varlen_forward(
     scale: float,
     return_output: bool = True,
     prequantized_qkv: MixedFP8QKV | None = None,
+    kv_storage_override: str | None = None,
 ) -> tuple[torch.Tensor | None, torch.Tensor]:
     """Return selected-block output (optionally) and LSE using bounded chunks."""
 
@@ -226,7 +227,11 @@ def sparse_flash_varlen_forward(
 
         schedule = metadata.kv_outer_schedule
         assert schedule is not None
-        kv_storage = os.environ.get("MSA_KV_STORAGE", "bf16").lower()
+        kv_storage = (
+            os.environ.get("MSA_KV_STORAGE", "bf16")
+            if kv_storage_override is None
+            else kv_storage_override
+        ).lower()
         if kv_storage not in ("bf16", "fp8"):
             raise ValueError("MSA_KV_STORAGE must be 'bf16' or 'fp8'")
         if prequantized_qkv is not None and kv_storage != "fp8":
