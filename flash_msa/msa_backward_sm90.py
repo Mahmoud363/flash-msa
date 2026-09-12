@@ -13,8 +13,9 @@ import cutlass
 import torch
 from cuda.bindings import driver as cuda
 from cutlass import Float32, Int32, cute
+from cutlass import pipeline
 from cutlass._mlir.dialects import nvvm
-from cutlass.cute.nvgpu import warpgroup
+from cutlass.cute.nvgpu import cpasync, warpgroup
 from cutlass.cute.runtime import from_dlpack
 from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass.utils import LayoutEnum
@@ -430,12 +431,60 @@ class _KVRowBackwardKernel:
     def __call__(self, q, k, v, grad_o, lse, delta, row_ptr, query_ids,
                  segment_starts, segment_lengths, segment_batches,
                  dq, dk, dv, scale: Float32, stream: cuda.CUstream):
+        batch, n_kv_heads, seq_len, head_dim = k.shape
+        kv_layout = cute.make_layout(
+            (seq_len, head_dim, n_kv_heads, batch),
+            stride=(
+                head_dim, 1, seq_len * head_dim,
+                n_kv_heads * seq_len * head_dim,
+            ),
+        )
+        k = cute.make_tensor(k.iterator, kv_layout)
+        v = cute.make_tensor(v.iterator, kv_layout)
         dtype = q.element_type
         layouts = [
             sm90_utils.make_smem_layout(dtype, LayoutEnum.ROW_MAJOR, shape, None)
             for shape in ((64, 128), (64, 128), (64, 128), (64, 128), (64, 64))
         ]
         sQ_layout, sK_layout, sV_layout, sdO_layout, sPdS_layout = layouts
+        q_copy_atom = cute.make_copy_atom(
+            cpasync.CopyG2SOp(cache_mode=cpasync.LoadCacheMode.GLOBAL),
+            dtype,
+            num_bits_per_copy=128,
+        )
+        q_copy_elements = 128 // dtype.width
+        q_threads_per_row = 128 // q_copy_elements
+        q_gmem_copy = cute.make_tiled_copy_tv(
+            q_copy_atom,
+            cute.make_ordered_layout(
+                (128 // q_threads_per_row, q_threads_per_row), order=(1, 0)
+            ),
+            cute.make_layout((1, q_copy_elements)),
+        )
+        self._q_copy_elements = q_copy_elements
+        kv_smem_atom = warpgroup.make_smem_layout_atom(
+            warpgroup.SmemLayoutAtomKind.K_SW128, dtype
+        )
+        sKV_layout_staged = cute.tile_to_shape(
+            kv_smem_atom, (64, 128, 1), (0, 1, 2)
+        )
+        sK_layout = cute.slice_(sKV_layout_staged, (None, None, 0))
+        sV_layout = sK_layout
+        layouts[1], layouts[2] = sK_layout, sV_layout
+        tma_k, tensor_k = cute.nvgpu.cpasync.make_tiled_tma_atom(
+            cute.nvgpu.cpasync.CopyBulkTensorTileG2SOp(),
+            k,
+            sK_layout,
+            (64, 128),
+        )
+        tma_v, tensor_v = cute.nvgpu.cpasync.make_tiled_tma_atom(
+            cute.nvgpu.cpasync.CopyBulkTensorTileG2SOp(),
+            v,
+            sV_layout,
+            (64, 128),
+        )
+        self._tma_k_bytes = cute.size_in_bytes(dtype, sK_layout)
+        self._tma_v_bytes = cute.size_in_bytes(dtype, sV_layout)
         mma_sdp = hopper_helpers.make_trivial_tiled_mma(
             dtype, dtype, warpgroup.OperandMajorMode.K,
             warpgroup.OperandMajorMode.K, Float32, (1, 1, 1), (64, 64)
@@ -451,28 +500,39 @@ class _KVRowBackwardKernel:
 
         @cute.struct
         class SharedStorage:
+            k_barriers: cute.struct.MemRange[cutlass.Int64, 2]
+            v_barriers: cute.struct.MemRange[cutlass.Int64, 2]
             sQ: cute.struct.Align[cute.struct.MemRange[dtype, cute.cosize(sQ_layout)], 1024]
-            sK: cute.struct.Align[cute.struct.MemRange[dtype, cute.cosize(sK_layout)], 1024]
-            sV: cute.struct.Align[cute.struct.MemRange[dtype, cute.cosize(sV_layout)], 1024]
+            sK: cute.struct.Align[
+                cute.struct.MemRange[dtype, cute.cosize(sKV_layout_staged)], 1024
+            ]
+            sV: cute.struct.Align[
+                cute.struct.MemRange[dtype, cute.cosize(sKV_layout_staged)], 1024
+            ]
             sdO: cute.struct.Align[cute.struct.MemRange[dtype, cute.cosize(sdO_layout)], 1024]
             sP: cute.struct.Align[cute.struct.MemRange[dtype, cute.cosize(sPdS_layout)], 1024]
             sdS: cute.struct.Align[cute.struct.MemRange[dtype, cute.cosize(sPdS_layout)], 1024]
 
         self._kvrow_storage = SharedStorage
         self.kernel(
-            q, k, v, grad_o, lse, delta, row_ptr, query_ids,
+            q, tma_k, tensor_k, tma_v, tensor_v,
+            grad_o, lse, delta, row_ptr, query_ids,
             segment_starts, segment_lengths, segment_batches, dq, dk, dv,
-            scale, mma_sdp, mma_dkv, mma_dq, *layouts,
+            scale, mma_sdp, mma_dkv, mma_dq, q_gmem_copy,
+            sKV_layout_staged, *layouts,
         ).launch(
             grid=[self.num_rows * 2, 1, 1], block=[128, 1, 1],
             smem=SharedStorage.size_in_bytes(), stream=stream
         )
 
     @cute.kernel
-    def kernel(self, q, k, v, grad_o, lse, delta, row_ptr, query_ids,
+    def kernel(self, q, tma_k, k, tma_v, v,
+               grad_o, lse, delta, row_ptr, query_ids,
                segment_starts, segment_lengths, segment_batches, dq, dk, dv,
                scale: Float32, mma_sdp: cute.TiledMma, mma_dkv: cute.TiledMma,
-               mma_dq: cute.TiledMma, sQ_layout, sK_layout, sV_layout,
+               mma_dq: cute.TiledMma, q_gmem_copy: cute.TiledCopy,
+               sKV_layout_staged,
+               sQ_layout, sK_layout, sV_layout,
                sdO_layout, sPdS_layout):
         tidx, _, _ = cute.arch.thread_idx()
         block_idx, _, _ = cute.arch.block_idx()
@@ -505,20 +565,65 @@ class _KVRowBackwardKernel:
 
         storage = cutlass.utils.SmemAllocator().allocate(self._kvrow_storage)
         sQ = storage.sQ.get_tensor(sQ_layout.outer, swizzle=sQ_layout.inner)
-        sK = storage.sK.get_tensor(sK_layout.outer, swizzle=sK_layout.inner)
-        sV = storage.sV.get_tensor(sV_layout.outer, swizzle=sV_layout.inner)
+        sK_staged = storage.sK.get_tensor(
+            sKV_layout_staged.outer, swizzle=sKV_layout_staged.inner
+        )
+        sV_staged = storage.sV.get_tensor(
+            sKV_layout_staged.outer, swizzle=sKV_layout_staged.inner
+        )
+        sK = cute.slice_(sK_staged, (None, None, 0))
+        sV = cute.slice_(sV_staged, (None, None, 0))
         sdO = storage.sdO.get_tensor(sdO_layout.outer, swizzle=sdO_layout.inner)
         sP = storage.sP.get_tensor(sPdS_layout.outer, swizzle=sPdS_layout.inner)
         sdS = storage.sdS.get_tensor(sPdS_layout.outer, swizzle=sPdS_layout.inner)
 
-        linear = tidx
-        while linear < Int32(64 * 128):
-            kr = linear // Int32(128)
-            col = linear - kr * Int32(128)
-            sK[kr, col] = k[batch_idx, kv_head, key_start + kr, col]
-            sV[kr, col] = v[batch_idx, kv_head, key_start + kr, col]
-            linear += Int32(128)
-        cute.arch.sync_threads()
+        producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
+        consumer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread, 4)
+        k_pipe = pipeline.PipelineTmaAsync.create(
+            barrier_storage=storage.k_barriers.data_ptr(),
+            num_stages=1,
+            producer_group=producer_group,
+            consumer_group=consumer_group,
+            tx_count=self._tma_k_bytes,
+        )
+        v_pipe = pipeline.PipelineTmaAsync.create(
+            barrier_storage=storage.v_barriers.data_ptr(),
+            num_stages=1,
+            producer_group=producer_group,
+            consumer_group=consumer_group,
+            tx_count=self._tma_v_bytes,
+        )
+        gK = cute.local_tile(k[None, None, kv_head, batch_idx], (64, 128), (None, 0))
+        gV = cute.local_tile(v[None, None, kv_head, batch_idx], (64, 128), (None, 0))
+        cta_layout = cute.make_layout(1)
+        tKsK, tKgK = cute.nvgpu.cpasync.tma_partition(
+            tma_k, 0, cta_layout,
+            cute.group_modes(sK_staged, 0, 2), cute.group_modes(gK, 0, 2),
+        )
+        tVsV, tVgV = cute.nvgpu.cpasync.tma_partition(
+            tma_v, 0, cta_layout,
+            cute.group_modes(sV_staged, 0, 2), cute.group_modes(gV, 0, 2),
+        )
+        k_producer = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, 1)
+        v_producer = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, 1)
+        k_consumer = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, 1)
+        v_consumer = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, 1)
+        warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+        if warp_idx == 0:
+            k_pipe.producer_acquire(k_producer)
+            cute.copy(
+                tma_k, tKgK[(None, key_start // Int32(64))], tKsK[(None, 0)],
+                tma_bar_ptr=k_pipe.producer_get_barrier(k_producer),
+            )
+            k_pipe.producer_commit(k_producer)
+            v_pipe.producer_acquire(v_producer)
+            cute.copy(
+                tma_v, tVgV[(None, key_start // Int32(64))], tVsV[(None, 0)],
+                tma_bar_ptr=v_pipe.producer_get_barrier(v_producer),
+            )
+            v_pipe.producer_commit(v_producer)
+        k_pipe.consumer_wait(k_consumer)
+        v_pipe.consumer_wait(v_consumer)
 
         thr_dkv = mma_dkv.get_slice(tidx)
         c_dkv = thr_dkv.partition_C(cute.make_identity_tensor((64, 128)))
@@ -532,10 +637,13 @@ class _KVRowBackwardKernel:
         row_count = local_query_count + edge_end - edge_begin
         row_work_base = Int32(0)
         while row_work_base < row_count:
-            linear = tidx
-            while linear < Int32(64 * 128):
-                qr = linear // Int32(128)
-                col = linear - qr * Int32(128)
+            q_copy = q_gmem_copy.get_slice(tidx)
+            tQsQ = q_copy.partition_D(sQ)
+            tdOsdO = q_copy.partition_D(sdO)
+            q_coords = cute.make_identity_tensor((self.rows, 128))
+            tQcQ = q_copy.partition_S(q_coords)
+            for copy_row in cutlass.range_constexpr(tQsQ.shape[1]):
+                qr = tQcQ[0, copy_row, 0][0]
                 slot = qr // Int32(self.main_per_proxy)
                 head_off = qr - slot * Int32(self.main_per_proxy)
                 local_work = row_work_base + slot
@@ -547,14 +655,45 @@ class _KVRowBackwardKernel:
                     else:
                         qid = query_ids[edge_begin + local_work - local_query_count]
                 main_head = proxy_head * Int32(self.main_per_proxy) + head_off
-                value_q = q.element_type(0.0)
-                value_do = q.element_type(0.0)
                 if valid:
-                    value_q = q[batch_idx, main_head, qid, col]
-                    value_do = grad_o[batch_idx, main_head, qid, col]
-                sQ[qr, col] = value_q
-                sdO[qr, col] = value_do
-                linear += Int32(128)
+                    q_source = cute.make_tensor(
+                        cute.make_ptr(
+                            q.element_type,
+                            _elem_pointer(q, (batch_idx, main_head, qid, 0)).llvm_ptr,
+                            cute.AddressSpace.gmem,
+                            assumed_align=16,
+                        ),
+                        cute.make_layout(128),
+                    )
+                    do_source = cute.make_tensor(
+                        cute.make_ptr(
+                            grad_o.element_type,
+                            _elem_pointer(
+                                grad_o, (batch_idx, main_head, qid, 0)
+                            ).llvm_ptr,
+                            cute.AddressSpace.gmem,
+                            assumed_align=16,
+                        ),
+                        cute.make_layout(128),
+                    )
+                    q_vectors = cute.tiled_divide(q_source, (self._q_copy_elements,))
+                    do_vectors = cute.tiled_divide(do_source, (self._q_copy_elements,))
+                    for copy_col in cutlass.range_constexpr(tQsQ.shape[2]):
+                        vector = tQcQ[0, 0, copy_col][1] // self._q_copy_elements
+                        cute.copy(
+                            q_copy, q_vectors[None, vector],
+                            tQsQ[None, copy_row, copy_col],
+                        )
+                        cute.copy(
+                            q_copy, do_vectors[None, vector],
+                            tdOsdO[None, copy_row, copy_col],
+                        )
+                else:
+                    for copy_col in cutlass.range_constexpr(tQsQ.shape[2]):
+                        tQsQ[None, copy_row, copy_col].fill(q.element_type(0))
+                        tdOsdO[None, copy_row, copy_col].fill(q.element_type(0))
+            cute.arch.cp_async_commit_group()
+            cute.arch.cp_async_wait_group(0)
             cute.arch.sync_threads()
 
             thr_sdp = mma_sdp.get_slice(tidx)

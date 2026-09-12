@@ -196,6 +196,16 @@ is therefore not production-dispatched yet; the remaining Milestone 6 work is
 to recover the fixed/segmented performance gap with the shared Hopper pipeline
 before replacing the legacy backward.
 
+The first accepted backward I/O specialization replaces scalar resident K/V
+loads with Hopper TMA and gathers arbitrary reverse-CSR Q/dO rows through
+layout-partitioned 128-bit `cp.async`. At B=1, S=16K, Top-K=2K this reduces the
+fixed-length main backward from 21.379 ms to 8.212 ms, versus 18.538 ms for the
+legacy kernel. With 32 uneven documents it reduces the native kernel from
+4.090 ms to 1.461 ms, versus 3.324 ms for legacy. The same kernel handles both
+paths; document segments add only destination decoding and key-boundary
+predication. TMA alone measured 21.937 ms and was not retained as an isolated
+optimization—the wide gathered Q/dO loads are essential to the result.
+
 ## Milestone 4: FP8 KV storage with BF16 compute
 
 Store K/V as E4M3, load through TMA, and convert into BF16 shared-memory layouts
