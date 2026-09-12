@@ -373,6 +373,288 @@ def tma_load_selected_kv(
     return copied_k, copied_v
 
 
+class _FP8SelectedKVTmaKernel:
+    """Validate E4M3 TMA loads followed by scaled BF16 tile conversion."""
+
+    tile_size = 128
+
+    def __init__(self, num_tasks: int, proxy_heads_per_kv: int) -> None:
+        self.num_tasks = int(num_tasks)
+        self.proxy_heads_per_kv = int(proxy_heads_per_kv)
+
+    @cute.jit
+    def __call__(
+        self,
+        k: cute.Tensor,
+        v: cute.Tensor,
+        k_scale: cute.Tensor,
+        v_scale: cute.Tensor,
+        task_meta: cute.Tensor,
+        copied_k: cute.Tensor,
+        copied_v: cute.Tensor,
+        stream: cuda.CUstream,
+    ):
+        batch, n_kv_heads, seq_len, head_dim = k.shape
+        kv_layout = cute.make_layout(
+            (seq_len, head_dim, n_kv_heads, batch),
+            stride=(
+                head_dim,
+                1,
+                seq_len * head_dim,
+                n_kv_heads * seq_len * head_dim,
+            ),
+        )
+        k = cute.make_tensor(k.iterator, kv_layout)
+        v = cute.make_tensor(v.iterator, kv_layout)
+        fp8_dtype = k.element_type
+        output_dtype = copied_k.element_type
+        self._fp8_dtype = fp8_dtype
+        self._output_dtype = output_dtype
+        smem_atom = warpgroup.make_smem_layout_atom(
+            warpgroup.SmemLayoutAtomKind.K_SW128, fp8_dtype
+        )
+        smem_layout_staged = cute.tile_to_shape(
+            smem_atom, (self.tile_size, self.tile_size, 1), (0, 1, 2)
+        )
+        smem_layout = cute.slice_(smem_layout_staged, (None, None, 0))
+        tma_op = cute.nvgpu.cpasync.CopyBulkTensorTileG2SOp()
+        tma_k, tensor_k = cute.nvgpu.cpasync.make_tiled_tma_atom(
+            tma_op, k, smem_layout, (self.tile_size, self.tile_size)
+        )
+        tma_v, tensor_v = cute.nvgpu.cpasync.make_tiled_tma_atom(
+            tma_op, v, smem_layout, (self.tile_size, self.tile_size)
+        )
+        self._tma_bytes = cute.size_in_bytes(fp8_dtype, smem_layout)
+
+        @cute.struct
+        class SharedStorage:
+            k_barriers: cute.struct.MemRange[cutlass.Int64, 2]
+            v_barriers: cute.struct.MemRange[cutlass.Int64, 2]
+            sK: cute.struct.Align[
+                cute.struct.MemRange[fp8_dtype, cute.cosize(smem_layout_staged)],
+                1024,
+            ]
+            sV: cute.struct.Align[
+                cute.struct.MemRange[fp8_dtype, cute.cosize(smem_layout_staged)],
+                1024,
+            ]
+
+        self.shared_storage = SharedStorage
+        self.kernel(
+            tma_k,
+            tensor_k,
+            tma_v,
+            tensor_v,
+            k_scale,
+            v_scale,
+            task_meta,
+            copied_k,
+            copied_v,
+            smem_layout_staged,
+        ).launch(
+            grid=[self.num_tasks, 1, 1],
+            block=[128, 1, 1],
+            smem=SharedStorage.size_in_bytes(),
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        tma_k: cute.CopyAtom,
+        k: cute.Tensor,
+        tma_v: cute.CopyAtom,
+        v: cute.Tensor,
+        k_scale: cute.Tensor,
+        v_scale: cute.Tensor,
+        task_meta: cute.Tensor,
+        copied_k: cute.Tensor,
+        copied_v: cute.Tensor,
+        smem_layout_staged: cute.ComposedLayout,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        task_idx, _, _ = cute.arch.block_idx()
+        warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+        smem = cutlass.utils.SmemAllocator()
+        storage = smem.allocate(self.shared_storage)
+        sK = storage.sK.get_tensor(
+            smem_layout_staged.outer, swizzle=smem_layout_staged.inner
+        )
+        sV = storage.sV.get_tensor(
+            smem_layout_staged.outer, swizzle=smem_layout_staged.inner
+        )
+
+        producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
+        consumer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread, 4)
+        k_pipe = pipeline.PipelineTmaAsync.create(
+            barrier_storage=storage.k_barriers.data_ptr(),
+            num_stages=1,
+            producer_group=producer_group,
+            consumer_group=consumer_group,
+            tx_count=self._tma_bytes,
+        )
+        v_pipe = pipeline.PipelineTmaAsync.create(
+            barrier_storage=storage.v_barriers.data_ptr(),
+            num_stages=1,
+            producer_group=producer_group,
+            consumer_group=consumer_group,
+            tx_count=self._tma_bytes,
+        )
+
+        batch = task_meta[task_idx, 0]
+        proxy_head = task_meta[task_idx, 1]
+        key_block = task_meta[task_idx, 2]
+        kv_head = proxy_head // Int32(self.proxy_heads_per_kv)
+        gK = cute.local_tile(
+            k[None, None, kv_head, batch],
+            (self.tile_size, self.tile_size),
+            (None, 0),
+        )
+        gV = cute.local_tile(
+            v[None, None, kv_head, batch],
+            (self.tile_size, self.tile_size),
+            (None, 0),
+        )
+        cta_layout = cute.make_layout(1)
+        tKsK, tKgK = cute.nvgpu.cpasync.tma_partition(
+            tma_k, 0, cta_layout, cute.group_modes(sK, 0, 2), cute.group_modes(gK, 0, 2)
+        )
+        tVsV, tVgV = cute.nvgpu.cpasync.tma_partition(
+            tma_v, 0, cta_layout, cute.group_modes(sV, 0, 2), cute.group_modes(gV, 0, 2)
+        )
+        k_producer = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, 1)
+        v_producer = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, 1)
+        k_consumer = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, 1)
+        v_consumer = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, 1)
+        if warp_idx == 0:
+            k_pipe.producer_acquire(k_producer)
+            cute.copy(
+                tma_k,
+                tKgK[(None, key_block)],
+                tKsK[(None, 0)],
+                tma_bar_ptr=k_pipe.producer_get_barrier(k_producer),
+            )
+            k_pipe.producer_commit(k_producer)
+            v_pipe.producer_acquire(v_producer)
+            cute.copy(
+                tma_v,
+                tVgV[(None, key_block)],
+                tVsV[(None, 0)],
+                tma_bar_ptr=v_pipe.producer_get_barrier(v_producer),
+            )
+            v_pipe.producer_commit(v_producer)
+
+        k_pipe.consumer_wait(k_consumer)
+        v_pipe.consumer_wait(v_consumer)
+        k_value_scale = k_scale[batch, kv_head, key_block]
+        v_value_scale = v_scale[batch, kv_head, key_block]
+        # SM90 converts packed FP8 lanes; scalar E4M3 extension is not a legal
+        # instruction. Keep four adjacent values in registers for each cvt.
+        linear = tidx * Int32(4)
+        while linear < Int32(self.tile_size * self.tile_size):
+            packed_k = cute.make_rmem_tensor((4,), self._fp8_dtype)
+            packed_v = cute.make_rmem_tensor((4,), self._fp8_dtype)
+            restored_k = cute.make_rmem_tensor((4,), cutlass.Float32)
+            restored_v = cute.make_rmem_tensor((4,), cutlass.Float32)
+            for element in cutlass.range_constexpr(4):
+                element_linear = linear + Int32(element)
+                row = element_linear // Int32(self.tile_size)
+                col = element_linear - row * Int32(self.tile_size)
+                packed_k[element] = sK[row, col, 0]
+                packed_v[element] = sV[row, col, 0]
+            restored_k.store(packed_k.load().to(cutlass.Float32))
+            restored_v.store(packed_v.load().to(cutlass.Float32))
+            for element in cutlass.range_constexpr(4):
+                element_linear = linear + Int32(element)
+                row = element_linear // Int32(self.tile_size)
+                col = element_linear - row * Int32(self.tile_size)
+                copied_k[task_idx, row, col] = self._output_dtype(
+                    restored_k[element] * k_value_scale
+                )
+                copied_v[task_idx, row, col] = self._output_dtype(
+                    restored_v[element] * v_value_scale
+                )
+            linear += Int32(128 * 4)
+
+
+def tma_load_fp8_kv_as_bf16(
+    k: torch.Tensor,
+    v: torch.Tensor,
+    k_scale: torch.Tensor,
+    v_scale: torch.Tensor,
+    task_meta: torch.Tensor,
+    *,
+    n_proxy_heads: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """TMA-load selected E4M3 tiles and restore them to BF16."""
+
+    if k.shape != v.shape or k.ndim != 4 or k.shape[-1] != 128:
+        raise ValueError("k and v must have matching [B,Hkv,S,128] shapes")
+    if k.dtype != torch.float8_e4m3fn or v.dtype != torch.float8_e4m3fn:
+        raise TypeError("FP8 TMA K/V inputs must use float8_e4m3fn")
+    expected_scales = (k.shape[0], k.shape[1], k.shape[2] // 128)
+    if (
+        k_scale.shape != expected_scales
+        or v_scale.shape != expected_scales
+        or k_scale.dtype != torch.float32
+        or v_scale.dtype != torch.float32
+    ):
+        raise ValueError(f"K/V scales must be FP32 with shape {expected_scales}")
+    if task_meta.device != k.device or task_meta.dtype != torch.int32:
+        raise TypeError("task_meta must be an int32 tensor on the K/V device")
+    if task_meta.ndim != 2 or task_meta.shape[1] != 5:
+        raise ValueError("task_meta must have shape [T,5]")
+    if n_proxy_heads % k.shape[1]:
+        raise ValueError("proxy heads must be divisible by KV heads")
+    if torch.cuda.get_device_capability(k.device) != (9, 0):
+        raise RuntimeError("FP8 selected K/V TMA requires compute capability 9.0")
+
+    num_tasks = int(task_meta.shape[0])
+    copied_k = torch.empty((num_tasks, 128, 128), dtype=torch.bfloat16, device=k.device)
+    copied_v = torch.empty_like(copied_k)
+    if num_tasks == 0:
+        return copied_k, copied_v
+    k_cute = _to_cute_tensor(k.detach().contiguous())
+    v_cute = _to_cute_tensor(v.detach().contiguous())
+    ks_cute = _to_cute_tensor(k_scale.detach().contiguous())
+    vs_cute = _to_cute_tensor(v_scale.detach().contiguous())
+    task_cute = _to_cute_tensor(task_meta.contiguous())
+    copied_k_cute = _to_cute_tensor(copied_k)
+    copied_v_cute = _to_cute_tensor(copied_v)
+    stream = cuda.CUstream(torch.cuda.current_stream(k.device).cuda_stream)
+    key = (
+        "selected_fp8_kv_tma",
+        num_tasks,
+        int(n_proxy_heads) // int(k.shape[1]),
+    )
+    if key not in _COMPILE_CACHE:
+        kernel = _FP8SelectedKVTmaKernel(
+            num_tasks, int(n_proxy_heads) // int(k.shape[1])
+        )
+        _COMPILE_CACHE[key] = cute.compile(
+            kernel,
+            k_cute,
+            v_cute,
+            ks_cute,
+            vs_cute,
+            task_cute,
+            copied_k_cute,
+            copied_v_cute,
+            stream,
+        )
+    _COMPILE_CACHE[key](
+        k_cute,
+        v_cute,
+        ks_cute,
+        vs_cute,
+        task_cute,
+        copied_k_cute,
+        copied_v_cute,
+        stream,
+    )
+    return copied_k, copied_v
+
+
 class _SelectedQKWgmmaKernel:
     """One selected 64x128 QK tile using warp-specialized TMA/WGMMA."""
 
@@ -1240,6 +1522,7 @@ def wgmma_selected_attention(
 
 __all__ = [
     "persistent_claim_work",
+    "tma_load_fp8_kv_as_bf16",
     "tma_load_selected_kv",
     "wgmma_selected_qk",
     "wgmma_selected_softmax",

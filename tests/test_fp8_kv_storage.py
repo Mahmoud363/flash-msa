@@ -9,6 +9,7 @@ from flash_msa.msa_kv_fp8 import (
     quantize_kv_e4m3_cutedsl,
     quantize_kv_e4m3_reference,
 )
+from flash_msa.msa_forward_sm90 import tma_load_fp8_kv_as_bf16
 
 
 def _require_sm90() -> None:
@@ -69,3 +70,28 @@ def test_fp8_kv_payload_is_about_half_bf16() -> None:
 
     # Two FP32 scales per 128x128 K/V tile add only 8 bytes to 32 KiB FP8 data.
     assert ratio == pytest.approx(0.5001220703125)
+
+
+def test_fp8_kv_tma_restores_selected_bf16_tiles() -> None:
+    _require_sm90()
+    k, v = _inputs()
+    storage = quantize_kv_e4m3_cutedsl(k, v)
+    # Columns are [batch, proxy head, key block, query count, edge offset].
+    task_meta = torch.tensor(
+        [[0, 0, 1, 1, 0], [1, 3, 0, 1, 1]],
+        device="cuda",
+        dtype=torch.int32,
+    )
+    copied_k, copied_v = tma_load_fp8_kv_as_bf16(
+        storage.k,
+        storage.v,
+        storage.k_scale,
+        storage.v_scale,
+        task_meta,
+        n_proxy_heads=4,
+    )
+    restored_k, restored_v = dequantize_kv_e4m3(storage)
+    torch.testing.assert_close(copied_k[0], restored_k[0, 0, 128:256], rtol=0, atol=0)
+    torch.testing.assert_close(copied_v[0], restored_v[0, 0, 128:256], rtol=0, atol=0)
+    torch.testing.assert_close(copied_k[1], restored_k[1, 1, :128], rtol=0, atol=0)
+    torch.testing.assert_close(copied_v[1], restored_v[1, 1, :128], rtol=0, atol=0)
