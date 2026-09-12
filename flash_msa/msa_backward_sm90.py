@@ -497,19 +497,26 @@ class _KVRowBackwardKernel:
         acc_dv = cute.make_rmem_tensor(c_dkv.shape, Float32)
         acc_dk.fill(0.0)
         acc_dv.fill(0.0)
-        edge_base = edge_begin
-        while edge_base < edge_end:
+        # Forward always includes the query's own 128-token block, while the
+        # compact reverse CSR stores only remote selections.  Visit the local
+        # queries first, then the explicit CSR entries.
+        row_count = Int32(128) + edge_end - edge_begin
+        row_work_base = Int32(0)
+        while row_work_base < row_count:
             linear = tidx
             while linear < Int32(64 * 128):
                 qr = linear // Int32(128)
                 col = linear - qr * Int32(128)
                 slot = qr // Int32(self.main_per_proxy)
                 head_off = qr - slot * Int32(self.main_per_proxy)
-                edge = edge_base + slot
-                valid = edge < edge_end
+                local_work = row_work_base + slot
+                valid = local_work < row_count
                 qid = Int32(0)
                 if valid:
-                    qid = query_ids[edge]
+                    if local_work < Int32(128):
+                        qid = key_block * Int32(128) + local_work
+                    else:
+                        qid = query_ids[edge_begin + local_work - Int32(128)]
                 main_head = proxy_head * Int32(self.main_per_proxy) + head_off
                 value_q = q.element_type(0.0)
                 value_do = q.element_type(0.0)
@@ -540,11 +547,14 @@ class _KVRowBackwardKernel:
                     qr, kc = coord[0], coord[1]
                     slot = qr // Int32(self.main_per_proxy)
                     head_off = qr - slot * Int32(self.main_per_proxy)
-                    edge = edge_base + slot
-                    valid = edge < edge_end
+                    local_work = row_work_base + slot
+                    valid = local_work < row_count
                     qid = Int32(0)
                     if valid:
-                        qid = query_ids[edge]
+                        if local_work < Int32(128):
+                            qid = key_block * Int32(128) + local_work
+                        else:
+                            qid = query_ids[edge_begin + local_work - Int32(128)]
                     main_head = proxy_head * Int32(self.main_per_proxy) + head_off
                     valid = valid and key_start + kc <= qid
                     probability = Float32(0.0)
@@ -594,16 +604,20 @@ class _KVRowBackwardKernel:
                     qr = coord[0]
                     slot = qr // Int32(self.main_per_proxy)
                     head_off = qr - slot * Int32(self.main_per_proxy)
-                    edge = edge_base + slot
-                    if edge < edge_end:
-                        qid = query_ids[edge]
+                    local_work = row_work_base + slot
+                    if local_work < row_count:
+                        qid = Int32(0)
+                        if local_work < Int32(128):
+                            qid = key_block * Int32(128) + local_work
+                        else:
+                            qid = query_ids[edge_begin + local_work - Int32(128)]
                         main_head = proxy_head * Int32(self.main_per_proxy) + head_off
                         _atomic_add_fp32(
                             dq_values_mn[ri, ci],
                             _elem_pointer(dq, (batch_idx, main_head, qid, coord[1])),
                         )
             cute.arch.sync_threads()
-            edge_base += Int32(self.queries_per_group)
+            row_work_base += Int32(self.queries_per_group)
 
         dkv_coords_mn = cute.make_tensor(
             c_dkv.iterator, _layout_acc_mn(mma_dkv, c_dkv.layout)

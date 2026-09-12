@@ -67,8 +67,8 @@ def test_kv_row_backward_matches_dense_causal_attention() -> None:
     output = torch.einsum("bhst,bhtd->bhsd", probability, v_heads)
     lse = scores.logsumexp(dim=-1)
     delta = (output * grad_out.float()).sum(dim=-1)
-    row_ptr = torch.tensor([0, seq_len], device="cuda", dtype=torch.int32)
-    query_ids = torch.arange(seq_len, device="cuda", dtype=torch.int32)
+    row_ptr = torch.tensor([0, 0], device="cuda", dtype=torch.int32)
+    query_ids = torch.empty(1, device="cuda", dtype=torch.int32)
     actual = wgmma_kv_row_backward_main(
         q, k, v, grad_out, lse, delta, row_ptr, query_ids,
         n_proxy_heads=proxy_heads, scale=scale,
