@@ -10,6 +10,8 @@ from flash_msa.msa_select_fp8 import (
     quantize_proxy_e4m3_per_head,
     selection_agreement,
 )
+from flash_msa.msa_select_cutedsl import select_blocks
+from flash_msa.msa_select_sm90 import select_blocks_fp8_sm90
 
 
 def _require_sm90() -> None:
@@ -61,3 +63,27 @@ def test_per_block_e4m3_quantization_uses_independent_scales() -> None:
     assert bool((scale[:, :, 1] > scale[:, :, 0] * 8).all())
     relative_l2 = (restored.float() - source.float()).norm() / source.float().norm()
     assert float(relative_l2) < 0.04
+
+
+def test_fp8_wgmma_selector_matches_dequantized_reference() -> None:
+    _require_sm90()
+    torch.manual_seed(79)
+    q = torch.randn(1, 4, 512, 128, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(1, 1, 512, 128, device="cuda", dtype=torch.bfloat16)
+    q8, q_scale = quantize_proxy_e4m3_per_block(q)
+    k8, k_scale = quantize_proxy_e4m3_per_block(k)
+    q_ref = dequantize_proxy_e4m3_per_block(q8, q_scale, dtype=q.dtype)
+    k_ref = dequantize_proxy_e4m3_per_block(k8, k_scale, dtype=k.dtype)
+    reference = select_blocks(
+        q_ref, k_ref, scale=128**-0.5, num_blocks=4, top_k_blocks=2
+    )
+    candidate = select_blocks_fp8_sm90(
+        q8,
+        k8,
+        q_scale,
+        k_scale,
+        scale=128**-0.5,
+        top_k_blocks=2,
+    )
+    agreement = selection_agreement(reference, candidate)
+    assert agreement.recall_at_k > 0.995

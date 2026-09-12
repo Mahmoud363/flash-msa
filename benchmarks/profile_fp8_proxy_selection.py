@@ -18,6 +18,7 @@ from flash_msa.msa_select_fp8 import (
     quantize_proxy_e4m3_per_head,
     selection_agreement,
 )
+from flash_msa.msa_select_sm90 import select_blocks_fp8_sm90
 
 
 def parse_args() -> argparse.Namespace:
@@ -94,6 +95,15 @@ def main() -> None:
     )
     block_candidate = select(q_block, k_block)
     block_agreement = selection_agreement(reference, block_candidate)
+    native_candidate = select_blocks_fp8_sm90(
+        q8_block,
+        k8_block,
+        q_block_scale,
+        k_block_scale,
+        scale=scale,
+        top_k_blocks=top_k_blocks,
+    )
+    native_agreement = selection_agreement(reference, native_candidate)
 
     for _ in range(args.warmup):
         quantize_proxy_e4m3_per_head(q)
@@ -103,6 +113,7 @@ def main() -> None:
 
     quantize_times = []
     selection_times = []
+    native_times = []
     for _ in range(args.repeats):
         quantize_ms, _ = elapsed_ms(
             lambda: (
@@ -111,18 +122,31 @@ def main() -> None:
             )
         )
         select_ms, _ = elapsed_ms(lambda: select(q_quantized, k_quantized))
+        native_ms, _ = elapsed_ms(
+            lambda: select_blocks_fp8_sm90(
+                q8_block,
+                k8_block,
+                q_block_scale,
+                k_block_scale,
+                scale=scale,
+                top_k_blocks=top_k_blocks,
+            )
+        )
         quantize_times.append(quantize_ms)
         selection_times.append(select_ms)
+        native_times.append(native_ms)
 
     result = {
         "case": vars(args) | {"json": None},
         "quality": {
             "per_head": vars(head_agreement),
             "per_block": vars(block_agreement),
+            "native_fp8_wgmma": vars(native_agreement),
         },
         "timing_ms": {
             "quantize_median": statistics.median(quantize_times),
             "dequantized_selection_median": statistics.median(selection_times),
+            "native_fp8_wgmma_median": statistics.median(native_times),
         },
     }
     result["case"].pop("json")
