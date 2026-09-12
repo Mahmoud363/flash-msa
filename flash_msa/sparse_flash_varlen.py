@@ -215,6 +215,53 @@ def sparse_flash_varlen_forward(
     else:
         output_accum = None
 
+    use_sm90_forward = (
+        os.environ.get("MSA_FORWARD_BACKEND", "fa3").lower() == "sm90"
+        and metadata.document_segments is None
+        and metadata.kv_outer_schedule is not None
+    )
+    if use_sm90_forward and metadata.num_remote_tasks:
+        from flash_msa.msa_forward_sm90 import wgmma_selected_attention
+
+        schedule = metadata.kv_outer_schedule
+        assert schedule is not None
+        remote_out, remote_lse = wgmma_selected_attention(
+            q,
+            k,
+            attention_v,
+            schedule.task_meta[: schedule.num_tasks],
+            schedule.query_indices[: schedule.num_edges],
+            n_proxy_heads=n_proxy_heads,
+            scale=float(scale),
+        )
+        if output_accum is None:
+            merge_lse_chunk_cuda(lse_accum, remote_lse, metadata, edge_start=0)
+        else:
+            merge_attention_chunk_cuda(
+                output_accum,
+                lse_accum,
+                remote_out,
+                remote_lse,
+                metadata,
+                edge_start=0,
+            )
+        lse = (
+            lse_accum.view(batch, n_proxy_heads, seq_len, main_per_proxy)
+            .permute(0, 1, 3, 2)
+            .contiguous()
+            .view(batch, n_heads, seq_len)
+        )
+        if output_accum is None:
+            return None, lse
+        output = (
+            output_accum.to(q.dtype)
+            .view(batch, n_proxy_heads, seq_len, main_per_proxy, head_dim)
+            .permute(0, 1, 3, 2, 4)
+            .contiguous()
+            .view(batch, n_heads, seq_len, head_dim)
+        )
+        return output, lse
+
     q_grouped = q.reshape(
         batch, n_proxy_heads, main_per_proxy, seq_len, head_dim
     ).permute(0, 1, 3, 2, 4)
