@@ -27,6 +27,9 @@ _COMPILE_CACHE = {}
 _NVVM_ATOMICRMW_HAS_RES = "res" in inspect.signature(nvvm.atomicrmw).parameters
 PRODUCER_REGISTERS = int(os.environ.get("MSA_SM90_PRODUCER_REGISTERS", "40"))
 CONSUMER_REGISTERS = int(os.environ.get("MSA_SM90_CONSUMER_REGISTERS", "232"))
+Q_PIPELINE_STAGES = int(os.environ.get("MSA_SM90_Q_PIPELINE_STAGES", "2"))
+if Q_PIPELINE_STAGES not in (1, 2):
+    raise ValueError("MSA_SM90_Q_PIPELINE_STAGES must be 1 or 2")
 
 
 def _to_cute_tensor(tensor: torch.Tensor) -> cute.Tensor:
@@ -592,7 +595,10 @@ class _SelectedQKWgmmaKernel:
             warpgroup.OperandSource.RMEM,
         )
         q_smem_staged = sm90_utils.make_smem_layout_a(
-            q_layout_enum, (self.rows, self.block, head_dim), dtype, 1
+            q_layout_enum,
+            (self.rows, self.block, head_dim),
+            dtype,
+            Q_PIPELINE_STAGES,
         )
         k_smem_staged = sm90_utils.make_smem_layout_b(
             k_layout_enum, (self.rows, self.block, head_dim), dtype, 1
@@ -621,6 +627,9 @@ class _SelectedQKWgmmaKernel:
         class SharedStorage:
             k_barriers: cute.struct.MemRange[cutlass.Int64, 2]
             v_barriers: cute.struct.MemRange[cutlass.Int64, 2]
+            q_barriers: cute.struct.MemRange[
+                cutlass.Int64, 2 * Q_PIPELINE_STAGES
+            ]
             task_index: cute.struct.MemRange[cutlass.Int32, 1]
             sQ: cute.struct.Align[
                 cute.struct.MemRange[dtype, cute.cosize(q_smem_staged)], 1024
@@ -715,6 +724,13 @@ class _SelectedQKWgmmaKernel:
             consumer_group=consumer_group,
             tx_count=self._tma_bytes,
         )
+        q_group = pipeline.CooperativeGroup(pipeline.Agent.Thread, 128)
+        q_pipe = pipeline.PipelineAsync.create(
+            barrier_storage=storage.q_barriers.data_ptr(),
+            num_stages=Q_PIPELINE_STAGES,
+            producer_group=q_group,
+            consumer_group=q_group,
+        )
 
         producer_state = pipeline.make_pipeline_state(
             pipeline.PipelineUserType.Producer, 1
@@ -727,6 +743,12 @@ class _SelectedQKWgmmaKernel:
         )
         v_consumer_state = pipeline.make_pipeline_state(
             pipeline.PipelineUserType.Consumer, 1
+        )
+        q_producer_state = pipeline.make_pipeline_state(
+            pipeline.PipelineUserType.Producer, Q_PIPELINE_STAGES
+        )
+        q_consumer_state = pipeline.make_pipeline_state(
+            pipeline.PipelineUserType.Consumer, Q_PIPELINE_STAGES
         )
         if warpgroup_idx == 0:
             cute.arch.setmaxregister_decrease(PRODUCER_REGISTERS)
@@ -805,11 +827,13 @@ class _SelectedQKWgmmaKernel:
                 v_pipe.consumer_wait(v_consumer_state)
 
             queries_per_tile = Int32(self.rows // self.main_per_proxy)
-            query_start = Int32(0)
-            while query_start < query_count:
-                # The producer gathers the next arbitrary CSR query group while
-                # K/V remain resident in shared memory for the entire work item.
-                if warpgroup_idx == 0:
+            if warpgroup_idx == 0:
+                query_start = Int32(0)
+                while query_start < query_count:
+                    q_pipe.producer_acquire(q_producer_state)
+                    q_stage = cute.slice_(
+                        sQ, (None, None, q_producer_state.index)
+                    )
                     linear = tidx
                     while linear < Int32(self.rows * self.block):
                         row = linear // Int32(self.block)
@@ -822,13 +846,18 @@ class _SelectedQKWgmmaKernel:
                         if valid:
                             qid = query_indices[edge_offset + query_slot]
                         head = proxy_head * Int32(self.main_per_proxy) + main_offset
-                        sQ[row, col, 0] = (
+                        q_stage[row, col] = (
                             q[qid, col, head, batch] if valid else self._dtype(0)
                         )
                         linear += Int32(128)
-                cute.arch.sync_threads()
+                    q_pipe.producer_commit(q_producer_state)
+                    q_producer_state.advance()
+                    query_start += queries_per_tile
 
-                if warpgroup_idx == 1:
+            if warpgroup_idx == 1:
+                query_start = Int32(0)
+                while query_start < query_count:
+                    q_pipe.consumer_wait(q_consumer_state)
                     wg_thread = tidx - Int32(128)
                     thr_mma = tiled_mma.get_slice(wg_thread)
                     tSsQ = thr_mma.partition_A(sQ)
@@ -840,7 +869,7 @@ class _SelectedQKWgmmaKernel:
                     cute.nvgpu.warpgroup.fence()
                     self._gemm_zero(
                         tiled_mma,
-                        tSrQ[(None, None, None, 0)],
+                        tSrQ[(None, None, None, q_consumer_state.index)],
                         tSrK[(None, None, None, 0)],
                         acc,
                     )
@@ -921,8 +950,9 @@ class _SelectedQKWgmmaKernel:
                         cute.size(output_accumulator), unroll_full=True
                     ):
                         tOg[i] = self._dtype(output_accumulator[i])
-                cute.arch.sync_threads()
-                query_start += queries_per_tile
+                    q_pipe.consumer_release(q_consumer_state)
+                    q_consumer_state.advance()
+                    query_start += queries_per_tile
 
             if warpgroup_idx == 1:
                 k_pipe.consumer_release(consumer_state)
