@@ -1,9 +1,7 @@
 """Native Hopper KV-outer selected-attention building blocks.
 
-The production forward remains in :mod:`sparse_flash_varlen` until the native
-consumer passes both correctness and long-context performance gates.  This
-module contains the independently testable persistent scheduler used by that
-consumer.
+The fixed-length SM90 forward can dispatch this consumer directly; focused
+validation hooks expose its scheduler, TMA loads, WGMMA math, and epilogue.
 """
 
 from __future__ import annotations
@@ -385,11 +383,16 @@ class _SelectedQKWgmmaKernel:
         proxy_per_kv: int,
         *,
         write_debug: bool = False,
+        persistent: bool = False,
+        num_ctas: int | None = None,
     ) -> None:
         self.num_tasks = int(num_tasks)
         self.main_per_proxy = int(main_per_proxy)
         self.proxy_per_kv = int(proxy_per_kv)
         self.write_debug = bool(write_debug)
+        self.persistent = bool(persistent)
+        self.num_ctas = int(num_ctas if num_ctas is not None else num_tasks)
+        self.claims_per_cta = (self.num_tasks + self.num_ctas - 1) // self.num_ctas
 
     @staticmethod
     @cute.jit
@@ -529,6 +532,7 @@ class _SelectedQKWgmmaKernel:
         probabilities: cute.Tensor,
         lse: cute.Tensor,
         output: cute.Tensor,
+        work_counter: cute.Tensor,
         scale: cutlass.Float32,
         stream: cuda.CUstream,
     ):
@@ -617,6 +621,7 @@ class _SelectedQKWgmmaKernel:
         class SharedStorage:
             k_barriers: cute.struct.MemRange[cutlass.Int64, 2]
             v_barriers: cute.struct.MemRange[cutlass.Int64, 2]
+            task_index: cute.struct.MemRange[cutlass.Int32, 1]
             sQ: cute.struct.Align[
                 cute.struct.MemRange[dtype, cute.cosize(q_smem_staged)], 1024
             ]
@@ -640,6 +645,7 @@ class _SelectedQKWgmmaKernel:
             probabilities,
             lse,
             output,
+            work_counter,
             scale * cutlass.Float32(1.4426950408889634),
             scale,
             tiled_mma,
@@ -648,7 +654,7 @@ class _SelectedQKWgmmaKernel:
             k_smem_staged,
             v_smem_staged,
         ).launch(
-            grid=[self.num_tasks, 1, 1],
+            grid=[self.num_ctas, 1, 1],
             block=[256, 1, 1],
             smem=SharedStorage.size_in_bytes(),
             stream=stream,
@@ -668,6 +674,7 @@ class _SelectedQKWgmmaKernel:
         probabilities: cute.Tensor,
         lse: cute.Tensor,
         output: cute.Tensor,
+        work_counter: cute.Tensor,
         scale_log2: cutlass.Float32,
         scale: cutlass.Float32,
         tiled_mma: cute.TiledMma,
@@ -677,7 +684,7 @@ class _SelectedQKWgmmaKernel:
         v_smem_staged: cute.ComposedLayout,
     ):
         tidx, _, _ = cute.arch.thread_idx()
-        task_idx, _, _ = cute.arch.block_idx()
+        block_idx, _, _ = cute.arch.block_idx()
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         warpgroup_idx = cute.arch.make_warp_uniform(tidx // Int32(128))
 
@@ -709,37 +716,6 @@ class _SelectedQKWgmmaKernel:
             tx_count=self._tma_bytes,
         )
 
-        batch = task_meta[task_idx, 0]
-        proxy_head = task_meta[task_idx, 1]
-        key_block = task_meta[task_idx, 2]
-        query_count = task_meta[task_idx, 3]
-        edge_offset = task_meta[task_idx, 4]
-        kv_head = proxy_head // Int32(self.proxy_per_kv)
-
-        gK = cute.local_tile(
-            k[None, None, kv_head, batch],
-            (self.block, self.block),
-            (None, 0),
-        )
-        tKsK, tKgK = cute.nvgpu.cpasync.tma_partition(
-            tma_k,
-            0,
-            cute.make_layout(1),
-            cute.group_modes(sK, 0, 2),
-            cute.group_modes(gK, 0, 2),
-        )
-        gV = cute.local_tile(
-            v[None, None, kv_head, batch],
-            (self.block, self.block),
-            (0, None),
-        )
-        tVsV, tVgV = cute.nvgpu.cpasync.tma_partition(
-            tma_v,
-            0,
-            cute.make_layout(1),
-            cute.group_modes(sV, 0, 2),
-            cute.group_modes(gV, 0, 2),
-        )
         producer_state = pipeline.make_pipeline_state(
             pipeline.PipelineUserType.Producer, 1
         )
@@ -752,152 +728,209 @@ class _SelectedQKWgmmaKernel:
         v_consumer_state = pipeline.make_pipeline_state(
             pipeline.PipelineUserType.Consumer, 1
         )
-
-        if warp_idx == 0:
-            k_pipe.producer_acquire(producer_state)
-            cute.copy(
-                tma_k,
-                tKgK[(None, key_block)],
-                tKsK[(None, 0)],
-                tma_bar_ptr=k_pipe.producer_get_barrier(producer_state),
-            )
-            k_pipe.producer_commit(producer_state)
-            v_pipe.producer_acquire(v_producer_state)
-            cute.copy(
-                tma_v,
-                tVgV[(None, key_block)],
-                tVsV[(None, 0)],
-                tma_bar_ptr=v_pipe.producer_get_barrier(v_producer_state),
-            )
-            v_pipe.producer_commit(v_producer_state)
-
         if warpgroup_idx == 0:
             cute.arch.setmaxregister_decrease(PRODUCER_REGISTERS)
-
         if warpgroup_idx == 1:
             cute.arch.setmaxregister_increase(CONSUMER_REGISTERS)
-            k_pipe.consumer_wait(consumer_state)
-            v_pipe.consumer_wait(v_consumer_state)
 
-        queries_per_tile = Int32(self.rows // self.main_per_proxy)
-        query_start = Int32(0)
-        while query_start < query_count:
-            # The producer gathers the next arbitrary CSR query group while
-            # K/V remain resident in shared memory for the entire work item.
-            if warpgroup_idx == 0:
-                linear = tidx
-                while linear < Int32(self.rows * self.block):
-                    row = linear // Int32(self.block)
-                    col = linear - row * Int32(self.block)
-                    tile_slot = row // Int32(self.main_per_proxy)
-                    query_slot = query_start + tile_slot
-                    main_offset = row - tile_slot * Int32(self.main_per_proxy)
-                    valid = query_slot < query_count
-                    qid = Int32(0)
-                    if valid:
-                        qid = query_indices[edge_offset + query_slot]
-                    head = proxy_head * Int32(self.main_per_proxy) + main_offset
-                    sQ[row, col, 0] = (
-                        q[qid, col, head, batch] if valid else self._dtype(0)
-                    )
-                    linear += Int32(128)
-            cute.arch.sync_threads()
+        task_index = storage.task_index.get_tensor(cute.make_layout(1))
+        # PERSISTENT_TASK_BODY_BEGIN
+        for _ in cutlass.range_constexpr(self.claims_per_cta):
+            task_idx = block_idx
+            if cutlass.const_expr(self.persistent):
+                if tidx == 0:
+                    task_index[0] = _atomic_claim(work_counter)
+                cute.arch.sync_threads()
+                task_idx = task_index[0]
+
+            active = task_idx < Int32(self.num_tasks)
+            if not active:
+                task_idx = Int32(0)
+
+            batch = task_meta[task_idx, 0]
+            proxy_head = task_meta[task_idx, 1]
+            key_block = task_meta[task_idx, 2]
+            query_count = task_meta[task_idx, 3]
+            if not active:
+                query_count = Int32(0)
+            edge_offset = task_meta[task_idx, 4]
+            kv_head = proxy_head // Int32(self.proxy_per_kv)
+
+            gK = cute.local_tile(
+                k[None, None, kv_head, batch],
+                (self.block, self.block),
+                (None, 0),
+            )
+            tKsK, tKgK = cute.nvgpu.cpasync.tma_partition(
+                tma_k,
+                0,
+                cute.make_layout(1),
+                cute.group_modes(sK, 0, 2),
+                cute.group_modes(gK, 0, 2),
+            )
+            gV = cute.local_tile(
+                v[None, None, kv_head, batch],
+                (self.block, self.block),
+                (0, None),
+            )
+            tVsV, tVgV = cute.nvgpu.cpasync.tma_partition(
+                tma_v,
+                0,
+                cute.make_layout(1),
+                cute.group_modes(sV, 0, 2),
+                cute.group_modes(gV, 0, 2),
+            )
+            if warp_idx == 0:
+                k_pipe.producer_acquire(producer_state)
+                cute.copy(
+                    tma_k,
+                    tKgK[(None, key_block)],
+                    tKsK[(None, 0)],
+                    tma_bar_ptr=k_pipe.producer_get_barrier(producer_state),
+                )
+                k_pipe.producer_commit(producer_state)
+                producer_state.advance()
+                v_pipe.producer_acquire(v_producer_state)
+                cute.copy(
+                    tma_v,
+                    tVgV[(None, key_block)],
+                    tVsV[(None, 0)],
+                    tma_bar_ptr=v_pipe.producer_get_barrier(v_producer_state),
+                )
+                v_pipe.producer_commit(v_producer_state)
+                v_producer_state.advance()
 
             if warpgroup_idx == 1:
-                wg_thread = tidx - Int32(128)
-                thr_mma = tiled_mma.get_slice(wg_thread)
-                tSsQ = thr_mma.partition_A(sQ)
-                tSsK = thr_mma.partition_B(sK)
-                tSrQ = thr_mma.make_fragment_A(tSsQ)
-                tSrK = thr_mma.make_fragment_B(tSsK)
-                acc_shape = thr_mma.partition_shape_C((self.rows, self.block))
-                acc = thr_mma.make_fragment_C(acc_shape)
-                cute.nvgpu.warpgroup.fence()
-                self._gemm_zero(
-                    tiled_mma,
-                    tSrQ[(None, None, None, 0)],
-                    tSrK[(None, None, None, 0)],
-                    acc,
-                )
-                cute.nvgpu.warpgroup.commit_group()
-                cute.nvgpu.warpgroup.wait_group(0)
-                if cutlass.const_expr(self.write_debug):
-                    if query_start == 0:
-                        g_scores = scores[task_idx, None, None]
-                        tCg = thr_mma.partition_C(g_scores)
-                        for i in cutlass.range(cute.size(acc), unroll_full=True):
-                            tCg[i] = acc[i]
-                row_max, row_sum = self._softmax_fp32(acc, tiled_mma, scale_log2)
-                if cutlass.const_expr(self.write_debug):
-                    if query_start == 0:
-                        g_probabilities = probabilities[task_idx, None, None]
-                        tPg = thr_mma.partition_C(g_probabilities)
-                        for i in cutlass.range(cute.size(acc), unroll_full=True):
-                            tPg[i] = acc[i]
+                k_pipe.consumer_wait(consumer_state)
+                v_pipe.consumer_wait(v_consumer_state)
 
-                coordinates = cute.make_identity_tensor((self.rows, self.block))
-                tCoordinates = thr_mma.partition_C(coordinates)
-                coordinates_mn = cute.make_tensor(
-                    tCoordinates.iterator,
-                    self._layout_acc_mn(tiled_mma, tCoordinates.layout),
-                )
-                lse_flat = cute.make_tensor(
-                    lse.iterator,
-                    cute.make_layout(lse.shape[0] * lse.shape[1], stride=1),
-                )
-                for row in cutlass.range_constexpr(cute.size(row_max)):
-                    coordinate = coordinates_mn[row, 0]
-                    if coordinate[1] == 0:
-                        lse_flat[
-                            (edge_offset + query_start)
-                            * Int32(self.main_per_proxy)
-                            + coordinate[0]
-                        ] = row_max[row] * scale + _math.log(row_sum[row])
+            queries_per_tile = Int32(self.rows // self.main_per_proxy)
+            query_start = Int32(0)
+            while query_start < query_count:
+                # The producer gathers the next arbitrary CSR query group while
+                # K/V remain resident in shared memory for the entire work item.
+                if warpgroup_idx == 0:
+                    linear = tidx
+                    while linear < Int32(self.rows * self.block):
+                        row = linear // Int32(self.block)
+                        col = linear - row * Int32(self.block)
+                        tile_slot = row // Int32(self.main_per_proxy)
+                        query_slot = query_start + tile_slot
+                        main_offset = row - tile_slot * Int32(self.main_per_proxy)
+                        valid = query_slot < query_count
+                        qid = Int32(0)
+                        if valid:
+                            qid = query_indices[edge_offset + query_slot]
+                        head = proxy_head * Int32(self.main_per_proxy) + main_offset
+                        sQ[row, col, 0] = (
+                            q[qid, col, head, batch] if valid else self._dtype(0)
+                        )
+                        linear += Int32(128)
+                cute.arch.sync_threads()
 
-                pv_thr_mma = pv_tiled_mma.get_slice(wg_thread)
-                tOsV = pv_thr_mma.partition_B(sV)
-                tOrV = pv_thr_mma.make_fragment_B(tOsV)
-                probability_operand = self._accumulator_to_operand(
-                    acc, pv_tiled_mma.tv_layout_A
-                )
-                output_shape = pv_thr_mma.partition_shape_C((self.rows, self.block))
-                output_accumulator = pv_thr_mma.make_fragment_C(output_shape)
-                cute.nvgpu.warpgroup.fence()
-                self._gemm_zero(
-                    pv_tiled_mma,
-                    probability_operand,
-                    tOrV[(None, None, None, 0)],
-                    output_accumulator,
-                )
-                cute.nvgpu.warpgroup.commit_group()
-                cute.nvgpu.warpgroup.wait_group(0)
-                output_flat = cute.make_tensor(
-                    output.iterator,
-                    cute.make_layout(
-                        (output.shape[0] * output.shape[1], self.block),
-                        stride=(self.block, 1),
-                    ),
-                )
-                output_offset = cute.domain_offset(
-                    (
-                        (edge_offset + query_start) * Int32(self.main_per_proxy),
-                        0,
-                    ),
-                    output_flat,
-                )
-                g_output = cute.make_tensor(
-                    output_offset.iterator,
-                    cute.make_layout(
-                        (self.rows, self.block), stride=(self.block, 1)
-                    ),
-                )
-                tOg = pv_thr_mma.partition_C(g_output)
-                for i in cutlass.range(
-                    cute.size(output_accumulator), unroll_full=True
-                ):
-                    tOg[i] = self._dtype(output_accumulator[i])
+                if warpgroup_idx == 1:
+                    wg_thread = tidx - Int32(128)
+                    thr_mma = tiled_mma.get_slice(wg_thread)
+                    tSsQ = thr_mma.partition_A(sQ)
+                    tSsK = thr_mma.partition_B(sK)
+                    tSrQ = thr_mma.make_fragment_A(tSsQ)
+                    tSrK = thr_mma.make_fragment_B(tSsK)
+                    acc_shape = thr_mma.partition_shape_C((self.rows, self.block))
+                    acc = thr_mma.make_fragment_C(acc_shape)
+                    cute.nvgpu.warpgroup.fence()
+                    self._gemm_zero(
+                        tiled_mma,
+                        tSrQ[(None, None, None, 0)],
+                        tSrK[(None, None, None, 0)],
+                        acc,
+                    )
+                    cute.nvgpu.warpgroup.commit_group()
+                    cute.nvgpu.warpgroup.wait_group(0)
+                    if cutlass.const_expr(self.write_debug):
+                        if query_start == 0:
+                            g_scores = scores[task_idx, None, None]
+                            tCg = thr_mma.partition_C(g_scores)
+                            for i in cutlass.range(cute.size(acc), unroll_full=True):
+                                tCg[i] = acc[i]
+                    row_max, row_sum = self._softmax_fp32(acc, tiled_mma, scale_log2)
+                    if cutlass.const_expr(self.write_debug):
+                        if query_start == 0:
+                            g_probabilities = probabilities[task_idx, None, None]
+                            tPg = thr_mma.partition_C(g_probabilities)
+                            for i in cutlass.range(cute.size(acc), unroll_full=True):
+                                tPg[i] = acc[i]
+
+                    coordinates = cute.make_identity_tensor((self.rows, self.block))
+                    tCoordinates = thr_mma.partition_C(coordinates)
+                    coordinates_mn = cute.make_tensor(
+                        tCoordinates.iterator,
+                        self._layout_acc_mn(tiled_mma, tCoordinates.layout),
+                    )
+                    lse_flat = cute.make_tensor(
+                        lse.iterator,
+                        cute.make_layout(lse.shape[0] * lse.shape[1], stride=1),
+                    )
+                    for row in cutlass.range_constexpr(cute.size(row_max)):
+                        coordinate = coordinates_mn[row, 0]
+                        if coordinate[1] == 0:
+                            lse_flat[
+                                (edge_offset + query_start)
+                                * Int32(self.main_per_proxy)
+                                + coordinate[0]
+                            ] = row_max[row] * scale + _math.log(row_sum[row])
+
+                    pv_thr_mma = pv_tiled_mma.get_slice(wg_thread)
+                    tOsV = pv_thr_mma.partition_B(sV)
+                    tOrV = pv_thr_mma.make_fragment_B(tOsV)
+                    probability_operand = self._accumulator_to_operand(
+                        acc, pv_tiled_mma.tv_layout_A
+                    )
+                    output_shape = pv_thr_mma.partition_shape_C((self.rows, self.block))
+                    output_accumulator = pv_thr_mma.make_fragment_C(output_shape)
+                    cute.nvgpu.warpgroup.fence()
+                    self._gemm_zero(
+                        pv_tiled_mma,
+                        probability_operand,
+                        tOrV[(None, None, None, 0)],
+                        output_accumulator,
+                    )
+                    cute.nvgpu.warpgroup.commit_group()
+                    cute.nvgpu.warpgroup.wait_group(0)
+                    output_flat = cute.make_tensor(
+                        output.iterator,
+                        cute.make_layout(
+                            (output.shape[0] * output.shape[1], self.block),
+                            stride=(self.block, 1),
+                        ),
+                    )
+                    output_offset = cute.domain_offset(
+                        (
+                            (edge_offset + query_start) * Int32(self.main_per_proxy),
+                            0,
+                        ),
+                        output_flat,
+                    )
+                    g_output = cute.make_tensor(
+                        output_offset.iterator,
+                        cute.make_layout(
+                            (self.rows, self.block), stride=(self.block, 1)
+                        ),
+                    )
+                    tOg = pv_thr_mma.partition_C(g_output)
+                    for i in cutlass.range(
+                        cute.size(output_accumulator), unroll_full=True
+                    ):
+                        tOg[i] = self._dtype(output_accumulator[i])
+                cute.arch.sync_threads()
+                query_start += queries_per_tile
+
+            if warpgroup_idx == 1:
+                k_pipe.consumer_release(consumer_state)
+                v_pipe.consumer_release(v_consumer_state)
+                consumer_state.advance()
+                v_consumer_state.advance()
             cute.arch.sync_threads()
-            query_start += queries_per_tile
+        # PERSISTENT_TASK_BODY_END
 
 
 def wgmma_selected_qk(
@@ -941,6 +974,8 @@ def wgmma_selected_qk(
     scores_cute = _to_cute_tensor(scores)
     probabilities_cute = _to_cute_tensor(probabilities)
     lse_cute = _to_cute_tensor(lse)
+    work_counter = torch.zeros(1, dtype=torch.int32, device=q.device)
+    counter_cute = _to_cute_tensor(work_counter)
     stream = cuda.CUstream(torch.cuda.current_stream(q.device).cuda_stream)
     key = (
         "selected_qk_wgmma",
@@ -965,6 +1000,7 @@ def wgmma_selected_qk(
             probabilities_cute,
             lse_cute,
             _to_cute_tensor(output),
+            counter_cute,
             1.0,
             stream,
         )
@@ -978,6 +1014,7 @@ def wgmma_selected_qk(
         probabilities_cute,
         lse_cute,
         _to_cute_tensor(output),
+        counter_cute,
         1.0,
         stream,
     )
@@ -1020,6 +1057,8 @@ def wgmma_selected_softmax(
     scores_cute = _to_cute_tensor(scores)
     probabilities_cute = _to_cute_tensor(probabilities)
     lse_cute = _to_cute_tensor(lse)
+    work_counter = torch.zeros(1, dtype=torch.int32, device=q.device)
+    counter_cute = _to_cute_tensor(work_counter)
     stream = cuda.CUstream(torch.cuda.current_stream(q.device).cuda_stream)
     key = (
         "selected_qk_wgmma",
@@ -1044,6 +1083,7 @@ def wgmma_selected_softmax(
             probabilities_cute,
             lse_cute,
             _to_cute_tensor(output),
+            counter_cute,
             float(scale),
             stream,
         )
@@ -1057,6 +1097,7 @@ def wgmma_selected_softmax(
         probabilities_cute,
         lse_cute,
         _to_cute_tensor(output),
+        counter_cute,
         float(scale),
         stream,
     )
@@ -1104,6 +1145,17 @@ def wgmma_selected_attention(
     probabilities_cute = _to_cute_tensor(probabilities)
     lse_cute = _to_cute_tensor(lse)
     output_cute = _to_cute_tensor(output)
+    sm_count = torch.cuda.get_device_properties(q.device).multi_processor_count
+    ctas_per_sm = max(1, int(os.environ.get("MSA_SM90_CTAS_PER_SM", "4")))
+    max_ctas = int(os.environ.get("MSA_SM90_MAX_CTAS", "0"))
+    num_ctas = min(num_tasks, ctas_per_sm * int(sm_count))
+    if max_ctas > 0:
+        num_ctas = min(num_ctas, max_ctas)
+    persistent = num_ctas < num_tasks
+    work_counter = (
+        torch.zeros(1, dtype=torch.int32, device=q.device) if persistent else None
+    )
+    counter_cute = _to_cute_tensor(work_counter) if persistent else qids_cute
     stream = cuda.CUstream(torch.cuda.current_stream(q.device).cuda_stream)
     key = (
         "selected_qk_wgmma",
@@ -1111,11 +1163,18 @@ def wgmma_selected_attention(
         main_per_proxy,
         proxy_per_kv,
         False,
+        persistent,
+        num_ctas,
         q_cute.element_type,
     )
     if key not in _COMPILE_CACHE:
         kernel = _SelectedQKWgmmaKernel(
-            num_tasks, main_per_proxy, proxy_per_kv, write_debug=False
+            num_tasks,
+            main_per_proxy,
+            proxy_per_kv,
+            write_debug=False,
+            persistent=persistent,
+            num_ctas=num_ctas,
         )
         _COMPILE_CACHE[key] = cute.compile(
             kernel,
@@ -1128,6 +1187,7 @@ def wgmma_selected_attention(
             probabilities_cute,
             lse_cute,
             output_cute,
+            counter_cute,
             float(scale),
             stream,
         )
@@ -1141,6 +1201,7 @@ def wgmma_selected_attention(
         probabilities_cute,
         lse_cute,
         output_cute,
+        counter_cute,
         float(scale),
         stream,
     )

@@ -185,3 +185,50 @@ def test_kv_work_item_reuses_tile_across_query_groups() -> None:
     )
     torch.testing.assert_close(output.float(), reference, rtol=1e-2, atol=2e-2)
     torch.testing.assert_close(lse, logits.logsumexp(dim=-1), rtol=3e-3, atol=3e-3)
+
+
+def test_persistent_attention_reclaims_multiple_tasks(monkeypatch) -> None:
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (9, 0):
+        pytest.skip("SM90 test")
+    monkeypatch.setenv("MSA_SM90_MAX_CTAS", "1")
+    torch.manual_seed(67)
+    q = torch.randn(1, 16, 512, 128, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(1, 2, 512, 128, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    qids = torch.cat(
+        [
+            torch.arange(32, 48, device="cuda", dtype=torch.int32),
+            torch.arange(192, 208, device="cuda", dtype=torch.int32),
+            torch.arange(352, 368, device="cuda", dtype=torch.int32),
+        ]
+    )
+    task_meta = torch.tensor(
+        [[0, 0, 0, 16, 0], [0, 1, 2, 16, 16], [0, 3, 1, 16, 32]],
+        device="cuda",
+        dtype=torch.int32,
+    )
+    scale = 128**-0.5
+    output, lse = wgmma_selected_attention(
+        q, k, v, task_meta, qids, n_proxy_heads=4, scale=scale
+    )
+    for task, (proxy_head, key_block, edge_offset) in enumerate(
+        [(0, 0, 0), (1, 2, 16), (3, 1, 32)]
+    ):
+        task_qids = qids[edge_offset : edge_offset + 16].long()
+        gathered_q = q[0, proxy_head * 4 : proxy_head * 4 + 4, task_qids]
+        gathered_q = gathered_q.permute(1, 0, 2)
+        kv_head = proxy_head // 2
+        kv_slice = slice(key_block * 128, (key_block + 1) * 128)
+        logits = torch.einsum(
+            "qhd,kd->qhk", gathered_q.float(), k[0, kv_head, kv_slice].float()
+        ) * scale
+        reference = torch.einsum(
+            "qhk,kd->qhd", logits.softmax(dim=-1), v[0, kv_head, kv_slice].float()
+        )
+        actual = slice(edge_offset, edge_offset + 16)
+        torch.testing.assert_close(
+            output[actual].float(), reference, rtol=1e-2, atol=2e-2
+        )
+        torch.testing.assert_close(
+            lse[actual], logits.logsumexp(dim=-1), rtol=3e-3, atol=3e-3
+        )
