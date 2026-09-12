@@ -46,3 +46,28 @@ denied access to hardware performance counters with `ERR_NVGPUCTRPERM`. Detailed
 tensor-core, occupancy, cache, and stall metrics require the cluster
 administrator to enable NVIDIA performance counters on the profiling node.
 
+## Fixed-length 16K optimization baseline
+
+The primary optimization case is fixed-length `B=1`, `S=16384`, Top-K 2048,
+with the same head configuration and BF16 dtype. Five warmups and twenty
+unprofiled iterations produced:
+
+- forward median: 11.404 ms;
+- backward median: 24.416 ms;
+- forward + backward median: 35.821 ms.
+
+The corresponding Nsight Systems trace used three warmups and five measured
+iterations. Across all eight iterations it recorded 2,453 kernel launches,
+approximately 307 launches per iteration. GPU kernel time was distributed as:
+
+- fused MSA backward: 60.8%, approximately 20.41 ms per invocation;
+- PyTorch indexing kernels: 11.3%;
+- online attention merge kernels: 8.1%;
+- remote FA3 forward kernels: 4.2% for the largest variant, with additional
+  smaller FA3 variants outside that percentage;
+- block selection: 2.8%, approximately 0.94 ms per invocation.
+
+This supersedes the 2K case for optimization decisions. The first fixed-length
+work should target backward throughput while avoiding additional indexing and
+launch fragmentation. The native KV-outer forward remains the next structural
+forward optimization.

@@ -163,7 +163,8 @@ occupancy costs.
 At minimum, measure:
 
 - batch sizes: 1 and 2;
-- sequence lengths: 2K, 8K, and the largest practical long-context case;
+- sequence lengths: 8K, 16K, and 32K, plus the largest practical long-context
+  case once memory scaling is characterized;
 - Top-K tokens: 512, 2048, and 4096 where valid;
 - masking: none and uneven packed documents;
 - phases: forward-only and forward+backward;
@@ -176,3 +177,6 @@ During the fixed-length phase, every benchmark change is measured first without
 masking. Document-masked regression tests continue to run after every commit so
 normal-path work cannot silently break varlen behavior. A matching varlen
 performance matrix is required when the porting phase begins.
+
+The 2K case is retained only as a quick smoke test and launch-overhead stress
+case. Optimization decisions must be supported by results at 16K or longer.
