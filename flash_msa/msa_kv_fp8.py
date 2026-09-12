@@ -42,6 +42,47 @@ class FP8KVStorage:
         )
 
 
+@dataclass(frozen=True)
+class MixedFP8QKV:
+    """Prequantized inputs for FP8-QK/BF16-PV selected attention.
+
+    The originating BF16 tensors remain separate and are used by local
+    attention and backward.  This bundle is produced at the Q/K/V projection
+    boundary and is never reconstructed inside sparse attention.
+    """
+
+    q: torch.Tensor
+    k: torch.Tensor
+    v: torch.Tensor
+    q_scale: torch.Tensor
+    k_scale: torch.Tensor
+    v_scale: torch.Tensor
+
+
+def prequantize_mixed_qkv_cutedsl(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
+) -> MixedFP8QKV:
+    """Prequantize Q/K/V once for the mixed FP8-QK/BF16-PV forward path."""
+
+    _validate_kv(k, v)
+    if q.ndim != 4 or q.shape[-1] != BLOCK_SIZE or q.shape[2] % BLOCK_SIZE:
+        raise ValueError("Q must have shape [B,H,S,128] with S divisible by 128")
+    if q.dtype != k.dtype or q.device != k.device:
+        raise ValueError("Q and K/V must have matching dtype and device")
+    if q.shape[0] != k.shape[0] or q.shape[2:] != k.shape[2:]:
+        raise ValueError("Q and K/V must agree on batch, sequence, and head dimension")
+    q8, q_scale = quantize_proxy_e4m3_per_block_cutedsl(q)
+    storage = quantize_kv_e4m3_cutedsl(k, v)
+    return MixedFP8QKV(
+        q=q8,
+        k=storage.k,
+        v=storage.v,
+        q_scale=q_scale,
+        k_scale=storage.k_scale,
+        v_scale=storage.v_scale,
+    )
+
+
 def _validate_kv(k: torch.Tensor, v: torch.Tensor) -> None:
     if k.shape != v.shape or k.ndim != 4:
         raise ValueError("K and V must have matching [B,H,S,128] shapes")
@@ -97,8 +138,10 @@ def bf16_kv_payload_bytes(k: torch.Tensor, v: torch.Tensor) -> int:
 
 __all__ = [
     "FP8KVStorage",
+    "MixedFP8QKV",
     "bf16_kv_payload_bytes",
     "dequantize_kv_e4m3",
     "quantize_kv_e4m3_cutedsl",
     "quantize_kv_e4m3_reference",
+    "prequantize_mixed_qkv_cutedsl",
 ]

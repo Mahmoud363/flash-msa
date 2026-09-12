@@ -3,7 +3,7 @@
 import pytest
 import torch
 
-from flash_msa import flash_msa_func
+from flash_msa import flash_msa_func, prequantize_mixed_qkv_cutedsl
 from flash_msa.msa_kv_fp8 import (
     bf16_kv_payload_bytes,
     dequantize_kv_e4m3,
@@ -152,7 +152,17 @@ def test_fp8_kv_fixed_length_training_is_stable(monkeypatch) -> None:
         monkeypatch.setenv("MSA_SELECT_BACKEND", "bf16")
         monkeypatch.setenv("MSA_KV_STORAGE", storage_backend)
         values = tuple(value.clone().requires_grad_(True) for value in inputs)
-        output, kl_loss = flash_msa_func(*values, 512, 128**-0.5)
+        prequantized = (
+            prequantize_mixed_qkv_cutedsl(values[2], values[3], values[4])
+            if storage_backend == "fp8"
+            else None
+        )
+        output, kl_loss = flash_msa_func(
+            *values,
+            512,
+            128**-0.5,
+            prequantized_qkv=prequantized,
+        )
         loss = output.float().square().mean() + kl_loss.float()
         gradients = torch.autograd.grad(loss, values)
         return output, loss, gradients

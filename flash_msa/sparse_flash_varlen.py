@@ -11,6 +11,7 @@ import os
 
 import torch
 
+from flash_msa.msa_kv_fp8 import MixedFP8QKV
 from flash_msa._flash_attn_compat import (
     flash_attn_supports_narrow_value_dim,
     flash_attn_varlen_forward,
@@ -147,6 +148,7 @@ def sparse_flash_varlen_forward(
     metadata: SparseAttentionMetadata,
     scale: float,
     return_output: bool = True,
+    prequantized_qkv: MixedFP8QKV | None = None,
 ) -> tuple[torch.Tensor | None, torch.Tensor]:
     """Return selected-block output (optionally) and LSE using bounded chunks."""
 
@@ -228,26 +230,50 @@ def sparse_flash_varlen_forward(
         kv_storage = os.environ.get("MSA_KV_STORAGE", "bf16").lower()
         if kv_storage not in ("bf16", "fp8"):
             raise ValueError("MSA_KV_STORAGE must be 'bf16' or 'fp8'")
+        if prequantized_qkv is not None and kv_storage != "fp8":
+            raise ValueError("prequantized_qkv requires MSA_KV_STORAGE=fp8")
         attention_kwargs = {}
         remote_q = q
         remote_k = k
         remote_v = attention_v
         if kv_storage == "fp8":
+            if prequantized_qkv is None:
+                raise ValueError(
+                    "MSA_KV_STORAGE=fp8 requires prequantized_qkv from the Q/K/V branch"
+                )
             if k.dtype != torch.bfloat16 or attention_v.dtype != torch.bfloat16:
-                raise TypeError("FP8 K/V storage currently requires BF16 K/V inputs")
+                raise TypeError("mixed FP8-QK/BF16-PV currently requires BF16 source tensors")
             if int(attention_v.shape[-1]) != BLOCK_SIZE:
                 raise ValueError("FP8 K/V storage requires a 128-dimensional V tensor")
-            from flash_msa.msa_kv_fp8 import quantize_kv_e4m3_cutedsl
-            from flash_msa.msa_select_fp8 import quantize_proxy_e4m3_per_block_cutedsl
-
-            storage = quantize_kv_e4m3_cutedsl(k, attention_v)
-            remote_q, q_scale = quantize_proxy_e4m3_per_block_cutedsl(q)
-            remote_k = storage.k
-            remote_v = storage.v
+            expected_q_scale = (batch, n_heads, num_blocks)
+            expected_kv_scale = (batch, n_kv_heads, num_blocks)
+            for name, packed, source in (
+                ("q", prequantized_qkv.q, q),
+                ("k", prequantized_qkv.k, k),
+                ("v", prequantized_qkv.v, attention_v),
+            ):
+                if packed.shape != source.shape or packed.device != source.device:
+                    raise ValueError(
+                        f"prequantized {name} must match its BF16 source shape and device"
+                    )
+                if packed.dtype != torch.float8_e4m3fn:
+                    raise TypeError(f"prequantized {name} must use E4M3 storage")
+            for name, packed_scale, expected in (
+                ("q", prequantized_qkv.q_scale, expected_q_scale),
+                ("k", prequantized_qkv.k_scale, expected_kv_scale),
+                ("v", prequantized_qkv.v_scale, expected_kv_scale),
+            ):
+                if packed_scale.shape != expected or packed_scale.dtype != torch.float32:
+                    raise ValueError(
+                        f"prequantized {name}_scale must be FP32 with shape {expected}"
+                    )
+            remote_q = prequantized_qkv.q
+            remote_k = prequantized_qkv.k
+            remote_v = prequantized_qkv.v
             attention_kwargs = {
-                "q_scale": q_scale,
-                "k_scale": storage.k_scale,
-                "v_scale": storage.v_scale,
+                "q_scale": prequantized_qkv.q_scale,
+                "k_scale": prequantized_qkv.k_scale,
+                "v_scale": prequantized_qkv.v_scale,
             }
         remote_out, remote_lse = wgmma_selected_attention(
             remote_q,

@@ -11,6 +11,7 @@ import statistics
 import torch
 
 from flash_msa import flash_msa_func
+from flash_msa.msa_kv_fp8 import MixedFP8QKV
 from flash_msa.msa_forward_sm90 import wgmma_selected_attention
 from flash_msa.msa_kv_fp8 import quantize_kv_e4m3_cutedsl
 from flash_msa.msa_select_cutedsl import select_blocks
@@ -64,6 +65,14 @@ def main() -> None:
     query_indices = schedule.query_indices[: schedule.num_edges]
     storage = quantize_kv_e4m3_cutedsl(k, v)
     q8, q_scale = quantize_proxy_e4m3_per_block_cutedsl(q)
+    prequantized = MixedFP8QKV(
+        q=q8,
+        k=storage.k,
+        v=storage.v,
+        q_scale=q_scale,
+        k_scale=storage.k_scale,
+        v_scale=storage.v_scale,
+    )
 
     def remote_bf16():
         return wgmma_selected_attention(
@@ -93,11 +102,28 @@ def main() -> None:
 
     inputs = (q_proxy, k_proxy, q, k, v)
 
-    def full(storage_backend: str):
+    def full(storage_backend: str, packed: MixedFP8QKV | None = None):
         os.environ["MSA_FORWARD_BACKEND"] = "sm90"
         os.environ["MSA_SELECT_BACKEND"] = "bf16"
         os.environ["MSA_KV_STORAGE"] = storage_backend
-        return flash_msa_func(*inputs, args.top_k, scale)
+        return flash_msa_func(
+            *inputs, args.top_k, scale, prequantized_qkv=packed
+        )
+
+    def full_fp8_conversion_inclusive():
+        packed_storage = quantize_kv_e4m3_cutedsl(k, v)
+        packed_q, packed_q_scale = quantize_proxy_e4m3_per_block_cutedsl(q)
+        return full(
+            "fp8",
+            MixedFP8QKV(
+                packed_q,
+                packed_storage.k,
+                packed_storage.v,
+                packed_q_scale,
+                packed_storage.k_scale,
+                packed_storage.v_scale,
+            ),
+        )
 
     for _ in range(args.warmup):
         quantize()
@@ -105,7 +131,7 @@ def main() -> None:
         remote_bf16()
         remote_fp8()
         full("bf16")
-        full("fp8")
+        full("fp8", prequantized)
     torch.cuda.synchronize()
     result = {
         "case": vars(args),
@@ -117,8 +143,11 @@ def main() -> None:
             "remote_bf16": timed(remote_bf16, args.repeats),
             "remote_fp8_prequantized": timed(remote_fp8, args.repeats),
             "full_bf16": timed(lambda: full("bf16"), args.repeats),
+            "full_fp8_prequantized": timed(
+                lambda: full("fp8", prequantized), args.repeats
+            ),
             "full_fp8_conversion_inclusive": timed(
-                lambda: full("fp8"), args.repeats
+                full_fp8_conversion_inclusive, args.repeats
             ),
         },
     }

@@ -7,6 +7,7 @@ import os
 
 import torch
 
+from flash_msa.msa_kv_fp8 import MixedFP8QKV
 from flash_msa.msa_select_cutedsl import compute_proxy_lse, select_blocks
 from flash_msa.msa_backward_cutedsl import run_fused_backward
 from flash_msa.msa_forward_cutedsl import run_main_forward
@@ -145,6 +146,7 @@ class _SparseAttentionFunction(torch.autograd.Function):
         scale: float,
         document_list: torch.Tensor | None,
         cu_seqlens: torch.Tensor | None,
+        prequantized_qkv: MixedFP8QKV | None,
     ):
         b, n_proxy_heads, s, head_dim = q_proxy.shape
         n_heads = q.shape[1]
@@ -204,6 +206,7 @@ class _SparseAttentionFunction(torch.autograd.Function):
             v,
             scale=float(scale),
             metadata=metadata,
+            prequantized_qkv=prequantized_qkv,
         )
 
         out = o_main.transpose(1, 2).reshape(b, s, -1)
@@ -332,7 +335,7 @@ class _SparseAttentionFunction(torch.autograd.Function):
             metadata,
             scale=ctx.scale,
         )
-        return dq_proxy, dk_proxy, dq, dk, dv, None, None, None, None
+        return dq_proxy, dk_proxy, dq, dk, dv, None, None, None, None, None
 
 
 def sparse_attention(
@@ -346,6 +349,7 @@ def sparse_attention(
     document_list: torch.Tensor | None = None,
     *,
     cu_seqlens: torch.Tensor | None = None,
+    prequantized_qkv: MixedFP8QKV | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return ``(attn_out, kl_loss placeholder)`` for sparse self-attention.
 
@@ -366,4 +370,5 @@ def sparse_attention(
         float(scale),
         document_list,
         cu_seqlens,
+        prequantized_qkv,
     )
