@@ -15,6 +15,7 @@ from flash_msa.msa_select_fp8 import (
     dequantize_proxy_e4m3,
     dequantize_proxy_e4m3_per_block,
     quantize_proxy_e4m3_per_block,
+    quantize_proxy_e4m3_per_block_cutedsl,
     quantize_proxy_e4m3_per_head,
     selection_agreement,
 )
@@ -104,6 +105,17 @@ def main() -> None:
         top_k_blocks=top_k_blocks,
     )
     native_agreement = selection_agreement(reference, native_candidate)
+    q8_fused, q_scale_fused = quantize_proxy_e4m3_per_block_cutedsl(q)
+    k8_fused, k_scale_fused = quantize_proxy_e4m3_per_block_cutedsl(k)
+    fused_candidate = select_blocks_fp8_sm90(
+        q8_fused,
+        k8_fused,
+        q_scale_fused,
+        k_scale_fused,
+        scale=scale,
+        top_k_blocks=top_k_blocks,
+    )
+    fused_agreement = selection_agreement(reference, fused_candidate)
 
     for _ in range(args.warmup):
         quantize_proxy_e4m3_per_head(q)
@@ -114,6 +126,21 @@ def main() -> None:
     quantize_times = []
     selection_times = []
     native_times = []
+    fused_quantize_times = []
+    fused_path_times = []
+
+    def run_fused_path() -> torch.Tensor:
+        q_value, q_value_scale = quantize_proxy_e4m3_per_block_cutedsl(q)
+        k_value, k_value_scale = quantize_proxy_e4m3_per_block_cutedsl(k)
+        return select_blocks_fp8_sm90(
+            q_value,
+            k_value,
+            q_value_scale,
+            k_value_scale,
+            scale=scale,
+            top_k_blocks=top_k_blocks,
+        )
+
     for _ in range(args.repeats):
         quantize_ms, _ = elapsed_ms(
             lambda: (
@@ -132,9 +159,18 @@ def main() -> None:
                 top_k_blocks=top_k_blocks,
             )
         )
+        fused_quantize_ms, _ = elapsed_ms(
+            lambda: (
+                quantize_proxy_e4m3_per_block_cutedsl(q),
+                quantize_proxy_e4m3_per_block_cutedsl(k),
+            )
+        )
+        fused_path_ms, _ = elapsed_ms(run_fused_path)
         quantize_times.append(quantize_ms)
         selection_times.append(select_ms)
         native_times.append(native_ms)
+        fused_quantize_times.append(fused_quantize_ms)
+        fused_path_times.append(fused_path_ms)
 
     result = {
         "case": vars(args) | {"json": None},
@@ -142,11 +178,14 @@ def main() -> None:
             "per_head": vars(head_agreement),
             "per_block": vars(block_agreement),
             "native_fp8_wgmma": vars(native_agreement),
+            "fused_fp8_path": vars(fused_agreement),
         },
         "timing_ms": {
             "quantize_median": statistics.median(quantize_times),
             "dequantized_selection_median": statistics.median(selection_times),
             "native_fp8_wgmma_median": statistics.median(native_times),
+            "fused_quantize_median": statistics.median(fused_quantize_times),
+            "fused_fp8_path_median": statistics.median(fused_path_times),
         },
     }
     result["case"].pop("json")

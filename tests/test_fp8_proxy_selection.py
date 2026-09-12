@@ -7,6 +7,7 @@ from flash_msa.msa_select_fp8 import (
     dequantize_proxy_e4m3,
     dequantize_proxy_e4m3_per_block,
     quantize_proxy_e4m3_per_block,
+    quantize_proxy_e4m3_per_block_cutedsl,
     quantize_proxy_e4m3_per_head,
     selection_agreement,
 )
@@ -87,3 +88,15 @@ def test_fp8_wgmma_selector_matches_dequantized_reference() -> None:
     )
     agreement = selection_agreement(reference, candidate)
     assert agreement.recall_at_k > 0.995
+
+
+def test_fused_cutedsl_quantizer_matches_reference_policy() -> None:
+    _require_sm90()
+    torch.manual_seed(83)
+    source = torch.randn(1, 2, 256, 128, device="cuda", dtype=torch.bfloat16)
+    expected_q, expected_scale = quantize_proxy_e4m3_per_block(source)
+    actual_q, actual_scale = quantize_proxy_e4m3_per_block_cutedsl(source)
+    torch.testing.assert_close(actual_scale, expected_scale, rtol=2e-6, atol=1e-8)
+    torch.testing.assert_close(
+        actual_q.float(), expected_q.float(), rtol=0, atol=0
+    )
