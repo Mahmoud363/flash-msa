@@ -800,12 +800,12 @@ class _SelectedQKWgmmaKernel:
             cute.nvgpu.warpgroup.wait_group(0)
             g_scores = scores[task_idx, None, None]
             tCg = thr_mma.partition_C(g_scores)
-            for i in cutlass.range_constexpr(cute.size(acc)):
+            for i in cutlass.range(cute.size(acc), unroll_full=True):
                 tCg[i] = acc[i]
             row_max, row_sum = self._softmax_fp32(acc, tiled_mma, scale_log2)
             g_probabilities = probabilities[task_idx, None, None]
             tPg = thr_mma.partition_C(g_probabilities)
-            for i in cutlass.range_constexpr(cute.size(acc)):
+            for i in cutlass.range(cute.size(acc), unroll_full=True):
                 tPg[i] = acc[i]
 
             coordinates = cute.make_identity_tensor((self.rows, self.block))
@@ -862,7 +862,9 @@ class _SelectedQKWgmmaKernel:
                 cute.make_layout((self.rows, self.block), stride=(self.block, 1)),
             )
             tOg = pv_thr_mma.partition_C(g_output)
-            for i in cutlass.range_constexpr(cute.size(output_accumulator)):
+            for i in cutlass.range(
+                cute.size(output_accumulator), unroll_full=True
+            ):
                 tOg[i] = self._dtype(output_accumulator[i])
 
 
