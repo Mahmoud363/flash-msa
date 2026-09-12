@@ -586,7 +586,15 @@ def select_blocks(
         raise ValueError("q_proxy and k_proxy must agree on batch, sequence, and head_dim")
     n_proxy_kv_heads = int(k_proxy.shape[1])
 
-    selection_backend = os.environ.get("MSA_SELECT_BACKEND", "bf16").lower()
+    selection_backend = os.environ.get("MSA_SELECT_BACKEND")
+    if selection_backend is None:
+        forward_backend = os.environ.get("MSA_FORWARD_BACKEND", "fa3").lower()
+        selection_backend = (
+            "fp8"
+            if forward_backend == "sm90" and document_segments is None
+            else "bf16"
+        )
+    selection_backend = selection_backend.lower()
     if selection_backend not in ("bf16", "fp8"):
         raise ValueError("MSA_SELECT_BACKEND must be 'bf16' or 'fp8'")
     if selection_backend == "fp8" and document_segments is None:

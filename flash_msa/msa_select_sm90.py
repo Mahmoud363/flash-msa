@@ -16,9 +16,11 @@ import cutlass.utils.hopper_helpers as sm90_utils
 
 BLOCK = 128
 ROWS = 64
-K_STAGES = 2
-PRODUCER_REGISTERS = int(os.environ.get("MSA_FP8_SELECT_PRODUCER_REGISTERS", "40"))
-CONSUMER_REGISTERS = int(os.environ.get("MSA_FP8_SELECT_CONSUMER_REGISTERS", "232"))
+K_STAGES = int(os.environ.get("MSA_FP8_SELECT_K_STAGES", "2"))
+if K_STAGES not in (1, 2, 3):
+    raise ValueError("MSA_FP8_SELECT_K_STAGES must be 1, 2, or 3")
+PRODUCER_REGISTERS = int(os.environ.get("MSA_FP8_SELECT_PRODUCER_REGISTERS", "48"))
+CONSUMER_REGISTERS = int(os.environ.get("MSA_FP8_SELECT_CONSUMER_REGISTERS", "224"))
 _COMPILE_CACHE: dict[tuple, object] = {}
 
 

@@ -66,11 +66,20 @@ def test_per_block_e4m3_quantization_uses_independent_scales() -> None:
     assert float(relative_l2) < 0.04
 
 
-def test_fp8_wgmma_selector_matches_dequantized_reference() -> None:
+@pytest.mark.parametrize(
+    ("n_proxy_heads", "n_proxy_kv_heads"), [(2, 1), (4, 1), (4, 2), (8, 2)]
+)
+def test_fp8_wgmma_selector_matches_dequantized_reference(
+    n_proxy_heads: int, n_proxy_kv_heads: int
+) -> None:
     _require_sm90()
     torch.manual_seed(79)
-    q = torch.randn(1, 4, 512, 128, device="cuda", dtype=torch.bfloat16)
-    k = torch.randn(1, 1, 512, 128, device="cuda", dtype=torch.bfloat16)
+    q = torch.randn(
+        1, n_proxy_heads, 512, 128, device="cuda", dtype=torch.bfloat16
+    )
+    k = torch.randn(
+        1, n_proxy_kv_heads, 512, 128, device="cuda", dtype=torch.bfloat16
+    )
     q8, q_scale = quantize_proxy_e4m3_per_block(q)
     k8, k_scale = quantize_proxy_e4m3_per_block(k)
     q_ref = dequantize_proxy_e4m3_per_block(q8, q_scale, dtype=q.dtype)
