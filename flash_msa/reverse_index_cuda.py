@@ -289,6 +289,61 @@ _DEFAULT_WORKSPACE = ReverseIndexWorkspace()
 
 
 @dataclass
+class KVOuterSchedule:
+    """GPU-resident KV-to-query CSR and persistent forward work descriptors.
+
+    Rows are ordered by ``(batch, proxy_head, key_block)`` for fixed-length
+    attention and by ``(proxy_head, key_segment)`` for document-masked
+    attention. ``row_ptr`` and ``query_indices`` form the CSR. ``task_meta``
+    subdivides non-empty rows into bounded query chunks with columns
+    ``[batch, proxy_head, key_unit, query_count, edge_offset]``.
+
+    ``destinations`` maps every packed edge to the flattened
+    ``(batch, proxy_head, query)`` output row. ``edge_positions`` provides the
+    inverse selected-slot mapping used by online merges. Only prefixes ending
+    at ``num_tasks`` and ``num_edges`` are valid; buffers may be padded so a
+    future persistent kernel can consume fixed-shape workspaces.
+    """
+
+    row_ptr: torch.Tensor
+    query_indices: torch.Tensor
+    task_meta: torch.Tensor
+    task_offsets: torch.Tensor
+    destinations: torch.Tensor
+    edge_positions: torch.Tensor
+    num_tasks: int
+    num_edges: int
+    num_key_units: int
+    segmented: bool
+
+    def validate(self) -> None:
+        tensors = (
+            self.row_ptr,
+            self.query_indices,
+            self.task_meta,
+            self.task_offsets,
+            self.destinations,
+            self.edge_positions,
+        )
+        if any(tensor.device.type != "cuda" for tensor in tensors):
+            raise ValueError("KV-outer schedule tensors must reside on CUDA")
+        if any(tensor.dtype != torch.int32 for tensor in tensors):
+            raise TypeError("KV-outer schedule tensors must have dtype torch.int32")
+        if self.row_ptr.ndim != 1:
+            raise ValueError("KV-outer CSR row_ptr must be one-dimensional")
+        if self.task_meta.ndim != 2 or self.task_meta.shape[1] != 5:
+            raise ValueError("KV-outer task_meta must have shape [T, 5]")
+        if not 0 <= self.num_tasks <= self.task_meta.shape[0]:
+            raise ValueError("KV-outer num_tasks exceeds its padded buffer")
+        if not 0 <= self.num_edges <= self.query_indices.numel():
+            raise ValueError("KV-outer num_edges exceeds its padded buffer")
+        if self.task_offsets.numel() < self.num_tasks + 1:
+            raise ValueError("KV-outer task_offsets is too short")
+        if self.num_key_units < 1:
+            raise ValueError("KV-outer schedule must contain key units")
+
+
+@dataclass
 class SparseAttentionMetadata:
     """Persistent reverse-index and compact varlen metadata for one forward."""
 
@@ -307,6 +362,7 @@ class SparseAttentionMetadata:
     top_k_blocks: int
     remote_query_chunk: int
     document_segments: DocumentSegmentMetadata | None = None
+    kv_outer_schedule: KVOuterSchedule | None = None
 
 
 def build_reverse_index_cuda(
@@ -486,7 +542,21 @@ def build_sparse_attention_metadata_cuda(
     )
     sizes_cpu = sizes.cpu()
     num_remote_tasks = int(sizes_cpu[0])
+    num_remote_edges = int(sizes_cpu[1])
     remote_task_meta_cpu = remote_task_meta[:num_remote_tasks].cpu()
+    kv_outer_schedule = KVOuterSchedule(
+        row_ptr=remote_bucket_offsets,
+        query_indices=packed_qids,
+        task_meta=remote_task_meta,
+        task_offsets=remote_task_offsets,
+        destinations=destinations,
+        edge_positions=edge_positions,
+        num_tasks=num_remote_tasks,
+        num_edges=num_remote_edges,
+        num_key_units=num_key_units,
+        segmented=document_segments is not None,
+    )
+    kv_outer_schedule.validate()
     return SparseAttentionMetadata(
         task_meta=task_meta,
         task_qids=task_qids,
@@ -503,6 +573,7 @@ def build_sparse_attention_metadata_cuda(
         top_k_blocks=top_k_blocks,
         remote_query_chunk=int(remote_query_chunk),
         document_segments=document_segments,
+        kv_outer_schedule=kv_outer_schedule,
     )
 
 
@@ -546,6 +617,7 @@ def merge_lse_chunk_cuda(
 
 __all__ = [
     "DocumentSegmentMetadata",
+    "KVOuterSchedule",
     "ReverseIndexWorkspace",
     "SparseAttentionMetadata",
     "build_reverse_index_cuda",
