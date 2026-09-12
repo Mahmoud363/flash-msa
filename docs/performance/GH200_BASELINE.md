@@ -89,3 +89,53 @@ Fixed-length, document-masked, and batch-size-two document-masked correctness
 tests passed. The chunk iterator is shared by both fixed-length and varlen paths,
 so the launch-amortization change applies to both; varlen may split chunks at
 full/partial segment access-mode boundaries.
+
+## Milestone 2: native SM90a KV-outer BF16 forward
+
+The fixed-length production path now consumes the reverse CSR schedule in a
+native Hopper CuTe kernel. Each work item selects one KV tile, loads K/V with
+TMA, reuses it across all associated query/head groups, executes QK and PV with
+WGMMA, computes softmax/LSE in FP32, and stores BF16 partial output plus FP32
+LSE for the existing online merge. Producer and consumer warpgroups use 40 and
+232 registers, respectively.
+
+The retained pipeline has two shared-memory Q stages. It overlaps gathering the
+next arbitrary CSR query group with QK/softmax/PV on the current group. At 16K,
+two stages measured 8.920 ms versus 9.343 ms for one stage. K/V remain
+single-stage because one tile is intentionally reused for the complete work
+item; double-buffering both would add 64 KiB per CTA without overlap inside a
+work item and would reduce occupancy. The 64x128 WGMMA tile and 512-query CSR
+chunk were the retained tile/work-size configuration.
+
+Dynamic persistent claiming is bounded to four CTAs per SM and activates only
+when the task grid exceeds that threshold. Smaller grids retain direct static
+assignment, avoiding the counter overhead measured at 16K (9.640 ms when
+forced versus 9.410 ms static before Q pipelining). A forced one-CTA test
+validates repeated claims and pipeline phase reuse across three heterogeneous
+tasks.
+
+Five warmups and twenty CUDA-event iterations on the same GH200 produced:
+
+| Path | Shape | Forward median | Backward median | Combined | Forward speedup |
+|---|---:|---:|---:|---:|---:|
+| FA3 | 16K / Top-K 2K | 10.721 ms | 23.348 ms | 34.069 ms | baseline |
+| native SM90a | 16K / Top-K 2K | 8.920 ms | 23.458 ms | 32.378 ms | 16.8% |
+| FA3 | 32K / Top-K 2K | 22.562 ms | 48.137 ms | 70.699 ms | baseline |
+| native SM90a | 32K / Top-K 2K | 18.586 ms | 48.790 ms | 67.375 ms | 17.6% |
+
+The backward kernel is unchanged in this forward milestone; its small paired
+variation is benchmark noise. Combined time improves by 5.0% at 16K and 4.7%
+at 32K.
+
+Correctness gates passed for fixed-length B=1 and B=2 training, including
+backward and optimizer updates; document-masked B=1 and B=2 fallback training;
+head-group ratios 2, 4, and 8; multiple query groups per KV item; and repeated
+persistent claims. The focused SM90 suite reports 12 passed tests.
+
+A headless Nsight Systems 2025.5.1 trace with three warmups and three measured
+iterations recorded 773 `cudaLaunchKernel` calls across six iterations,
+approximately 129 launches per iteration. The native selected-attention kernel
+ran six times, averaged 2.773 ms, and represented 8.8% of observed GPU kernel
+time. Nsight Compute hardware counters remain unavailable on this node because
+the driver returns `ERR_NVGPUCTRPERM`; this does not affect Nsight Systems CUDA
+and NVTX tracing.

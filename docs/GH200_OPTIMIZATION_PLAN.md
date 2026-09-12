@@ -91,7 +91,7 @@ Implementation order: first fuse/reduce overhead in the fixed-length path, then
 extend the same metadata representation and launch structure to document
 segments without regressing its aligned-block fast path.
 
-## Milestone 2: native SM90a KV-outer BF16 forward
+## Milestone 2: native SM90a KV-outer BF16 forward (complete)
 
 Replace packed remote-KV materialization plus repeated FA3 calls with a Hopper
 CuTe kernel that consumes the reverse index directly:
@@ -107,6 +107,20 @@ depth, tile shape, register pressure, and persistent scheduling.
 
 Exit criteria: correctness parity and a speedup over the FA3-backed baseline at
 the target long-context shapes.
+
+Completed on GH200 on 2026-09-12 for the fixed-length path. The accepted
+specialization uses a 64x128 query/KV WGMMA tile, one resident TMA K/V stage,
+a two-stage asynchronous Q-gather pipeline, 40 producer and 232 consumer
+registers, 512 queries per native CSR chunk, and adaptive persistent claiming
+above four CTAs per SM. The document-masked path deliberately retains its
+existing fallback until the later varlen port.
+
+The final BF16 B=1, Top-K 2048 measurements were 8.920 ms at 16K and 18.586 ms
+at 32K, compared with 10.721 ms and 22.562 ms for the FA3-backed path. Forward
+speedups are 16.8% and 17.6%, respectively. Fixed-length B=1/B=2 training
+parity, document-masked B=1/B=2 fallback parity, and 12 focused scheduler/TMA/
+WGMMA/FP32-softmax/epilogue tests passed. Detailed evidence is in
+`docs/performance/GH200_BASELINE.md`.
 
 ## Milestone 3: FP8 proxy/index branch
 
