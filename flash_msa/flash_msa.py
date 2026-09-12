@@ -13,6 +13,7 @@ from flash_msa.msa_backward_cutedsl import run_fused_backward
 from flash_msa.msa_forward_cutedsl import run_main_forward
 from flash_msa.reverse_index_cuda import (
     DocumentSegmentMetadata,
+    KVOuterSchedule,
     SparseAttentionMetadata,
     build_document_segment_metadata,
     build_document_segment_metadata_from_cu_seqlens,
@@ -226,6 +227,7 @@ class _SparseAttentionFunction(torch.autograd.Function):
             metadata.packed_qids,
             metadata.destinations,
             metadata.edge_positions,
+            metadata.kv_outer_schedule.row_ptr,
         )
         if document_segments is not None:
             save_tensors += (
@@ -245,6 +247,7 @@ class _SparseAttentionFunction(torch.autograd.Function):
         )
         ctx.scale = float(scale)
         ctx.num_remote_tasks = metadata.num_remote_tasks
+        ctx.num_remote_edges = metadata.kv_outer_schedule.num_edges
         ctx.remote_task_meta_cpu = metadata.remote_task_meta_cpu
         ctx.metadata_shape = (
             metadata.batch,
@@ -257,7 +260,7 @@ class _SparseAttentionFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_out: torch.Tensor | None, grad_kl: torch.Tensor | None):
-        base_tensors = ctx.saved_tensors[:14]
+        base_tensors = ctx.saved_tensors[:15]
         (
             q_proxy,
             k_proxy,
@@ -273,6 +276,7 @@ class _SparseAttentionFunction(torch.autograd.Function):
             packed_qids,
             destinations,
             edge_positions,
+            kv_row_ptr,
         ) = base_tensors
         document_segments = None
         if ctx.has_document_segments:
@@ -283,7 +287,7 @@ class _SparseAttentionFunction(torch.autograd.Function):
                 doc_first_segment,
                 token_segment_ids,
                 segment_cu_seqlens,
-            ) = ctx.saved_tensors[14:]
+            ) = ctx.saved_tensors[15:]
             document_segments = DocumentSegmentMetadata(
                 starts=segment_starts,
                 lengths=segment_lengths,
@@ -312,6 +316,22 @@ class _SparseAttentionFunction(torch.autograd.Function):
             top_k_blocks=top_k_blocks,
             remote_query_chunk=remote_query_chunk,
             document_segments=document_segments,
+            kv_outer_schedule=KVOuterSchedule(
+                row_ptr=kv_row_ptr,
+                query_indices=packed_qids,
+                task_meta=remote_task_meta,
+                task_offsets=remote_task_offsets,
+                destinations=destinations,
+                edge_positions=edge_positions,
+                num_tasks=ctx.num_remote_tasks,
+                num_edges=ctx.num_remote_edges,
+                num_key_units=(
+                    seq_len // 128
+                    if document_segments is None
+                    else document_segments.num_segments
+                ),
+                segmented=document_segments is not None,
+            ),
         )
 
         if grad_out is None:
