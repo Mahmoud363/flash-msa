@@ -59,7 +59,9 @@ def main() -> None:
                            top_k_blocks=args.top_k // 128,
                            document_segments=document_segments)
     metadata = build_sparse_attention_metadata_cuda(
-        blocks, backward_query_chunk=16, remote_query_chunk=512,
+        blocks,
+        backward_query_chunk=128 // (h // hp),
+        remote_query_chunk=512,
         document_segments=document_segments,
     )
     output, lse, _ = run_main_forward(q, k, v, scale=scale, metadata=metadata)
