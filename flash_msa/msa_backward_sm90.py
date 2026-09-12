@@ -7,22 +7,42 @@ its reverse-CSR scheduler is enabled.
 
 from __future__ import annotations
 
+import inspect
+
 import cutlass
 import torch
 from cuda.bindings import driver as cuda
 from cutlass import Float32, Int32, cute
+from cutlass._mlir.dialects import nvvm
 from cutlass.cute.nvgpu import warpgroup
 from cutlass.cute.runtime import from_dlpack
+from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass.utils import LayoutEnum
 import cutlass.utils.hopper_helpers as hopper_helpers
 from quack import layout_utils, sm90_utils
 
 
 _COMPILE_CACHE: dict[tuple[object, ...], object] = {}
+_NVVM_ATOMICRMW_HAS_RES = "res" in inspect.signature(nvvm.atomicrmw).parameters
 
 
 def _to_cute_tensor(tensor: torch.Tensor) -> cute.Tensor:
     return from_dlpack(tensor.detach(), assumed_align=16)
+
+
+@dsl_user_op
+def _atomic_add_fp32(value: Float32, pointer: cute.Pointer, *, loc=None, ip=None) -> None:
+    if _NVVM_ATOMICRMW_HAS_RES:
+        nvvm.atomicrmw(
+            T.f32(), nvvm.AtomicOpKind.FADD, pointer.llvm_ptr, value.ir_value()
+        )
+    else:
+        nvvm.atomicrmw(nvvm.AtomicOpKind.FADD, pointer.llvm_ptr, value.ir_value())
+
+
+@dsl_user_op
+def _elem_pointer(tensor: cute.Tensor, coord: cute.Coord, *, loc=None, ip=None):
+    return tensor.iterator + cute.crd2idx(coord, tensor.layout, loc=loc, ip=ip)
 
 
 def _layout_separate(threshold, source, reference):
@@ -373,6 +393,231 @@ class _BackwardAttentionTileKernel:
                     target[coord[0], coord[1]] = values_mn[row, col]
 
 
+class _KVRowBackwardKernel:
+    """Accumulate main-attention gradients for one reverse-CSR KV row.
+
+    A CTA owns one ``(batch, proxy-head, key-block, key-slice)`` work item,
+    keeps its K/V tile resident, and visits every selected query in that CSR
+    row in groups large enough to fill a 64-row WGMMA operation.
+    """
+
+    rows = 64
+    keys = 64
+    dim = 128
+
+    def __init__(self, batch, n_heads, n_kv_heads, n_proxy_heads, seq_len):
+        self.batch = int(batch)
+        self.n_heads = int(n_heads)
+        self.n_kv_heads = int(n_kv_heads)
+        self.n_proxy_heads = int(n_proxy_heads)
+        self.seq_len = int(seq_len)
+        self.num_blocks = self.seq_len // 128
+        self.main_per_proxy = self.n_heads // self.n_proxy_heads
+        self.proxy_per_kv = self.n_proxy_heads // self.n_kv_heads
+        self.queries_per_group = self.rows // self.main_per_proxy
+        self.num_rows = self.batch * self.n_proxy_heads * self.num_blocks
+
+    @cute.jit
+    def __call__(self, q, k, v, grad_o, lse, delta, row_ptr, query_ids,
+                 dq, dk, dv, scale: Float32, stream: cuda.CUstream):
+        dtype = q.element_type
+        layouts = [
+            sm90_utils.make_smem_layout(dtype, LayoutEnum.ROW_MAJOR, shape, None)
+            for shape in ((64, 128), (64, 128), (64, 128), (64, 128), (64, 64))
+        ]
+        sQ_layout, sK_layout, sV_layout, sdO_layout, sPdS_layout = layouts
+        mma_sdp = hopper_helpers.make_trivial_tiled_mma(
+            dtype, dtype, warpgroup.OperandMajorMode.K,
+            warpgroup.OperandMajorMode.K, Float32, (1, 1, 1), (64, 64)
+        )
+        mma_dkv = hopper_helpers.make_trivial_tiled_mma(
+            dtype, dtype, warpgroup.OperandMajorMode.MN,
+            warpgroup.OperandMajorMode.MN, Float32, (1, 1, 1), (64, 128)
+        )
+        mma_dq = hopper_helpers.make_trivial_tiled_mma(
+            dtype, dtype, warpgroup.OperandMajorMode.K,
+            warpgroup.OperandMajorMode.MN, Float32, (1, 1, 1), (64, 128)
+        )
+
+        @cute.struct
+        class SharedStorage:
+            sQ: cute.struct.Align[cute.struct.MemRange[dtype, cute.cosize(sQ_layout)], 1024]
+            sK: cute.struct.Align[cute.struct.MemRange[dtype, cute.cosize(sK_layout)], 1024]
+            sV: cute.struct.Align[cute.struct.MemRange[dtype, cute.cosize(sV_layout)], 1024]
+            sdO: cute.struct.Align[cute.struct.MemRange[dtype, cute.cosize(sdO_layout)], 1024]
+            sP: cute.struct.Align[cute.struct.MemRange[dtype, cute.cosize(sPdS_layout)], 1024]
+            sdS: cute.struct.Align[cute.struct.MemRange[dtype, cute.cosize(sPdS_layout)], 1024]
+
+        self._kvrow_storage = SharedStorage
+        self.kernel(q, k, v, grad_o, lse, delta, row_ptr, query_ids, dq, dk, dv,
+                    scale, mma_sdp, mma_dkv, mma_dq, *layouts).launch(
+            grid=[self.num_rows * 2, 1, 1], block=[128, 1, 1],
+            smem=SharedStorage.size_in_bytes(), stream=stream
+        )
+
+    @cute.kernel
+    def kernel(self, q, k, v, grad_o, lse, delta, row_ptr, query_ids, dq, dk, dv,
+               scale: Float32, mma_sdp: cute.TiledMma, mma_dkv: cute.TiledMma,
+               mma_dq: cute.TiledMma, sQ_layout, sK_layout, sV_layout,
+               sdO_layout, sPdS_layout):
+        tidx, _, _ = cute.arch.thread_idx()
+        block_idx, _, _ = cute.arch.block_idx()
+        row_idx = block_idx // Int32(2)
+        key_slice = block_idx - row_idx * Int32(2)
+        edge_begin = row_ptr[row_idx]
+        edge_end = row_ptr[row_idx + Int32(1)]
+
+        row_tmp = row_idx // Int32(self.num_blocks)
+        key_block = row_idx - row_tmp * Int32(self.num_blocks)
+        batch_idx = row_tmp // Int32(self.n_proxy_heads)
+        proxy_head = row_tmp - batch_idx * Int32(self.n_proxy_heads)
+        kv_head = proxy_head // Int32(self.proxy_per_kv)
+        key_start = key_block * Int32(128) + key_slice * Int32(64)
+
+        storage = cutlass.utils.SmemAllocator().allocate(self._kvrow_storage)
+        sQ = storage.sQ.get_tensor(sQ_layout.outer, swizzle=sQ_layout.inner)
+        sK = storage.sK.get_tensor(sK_layout.outer, swizzle=sK_layout.inner)
+        sV = storage.sV.get_tensor(sV_layout.outer, swizzle=sV_layout.inner)
+        sdO = storage.sdO.get_tensor(sdO_layout.outer, swizzle=sdO_layout.inner)
+        sP = storage.sP.get_tensor(sPdS_layout.outer, swizzle=sPdS_layout.inner)
+        sdS = storage.sdS.get_tensor(sPdS_layout.outer, swizzle=sPdS_layout.inner)
+
+        linear = tidx
+        while linear < Int32(64 * 128):
+            kr = linear // Int32(128)
+            col = linear - kr * Int32(128)
+            sK[kr, col] = k[batch_idx, kv_head, key_start + kr, col]
+            sV[kr, col] = v[batch_idx, kv_head, key_start + kr, col]
+            linear += Int32(128)
+        cute.arch.sync_threads()
+
+        thr_dkv = mma_dkv.get_slice(tidx)
+        c_dkv = thr_dkv.partition_C(cute.make_identity_tensor((64, 128)))
+        acc_dk = cute.make_rmem_tensor(c_dkv.shape, Float32)
+        acc_dv = cute.make_rmem_tensor(c_dkv.shape, Float32)
+        acc_dk.fill(0.0)
+        acc_dv.fill(0.0)
+        edge_base = edge_begin
+        while edge_base < edge_end:
+            linear = tidx
+            while linear < Int32(64 * 128):
+                qr = linear // Int32(128)
+                col = linear - qr * Int32(128)
+                slot = qr // Int32(self.main_per_proxy)
+                head_off = qr - slot * Int32(self.main_per_proxy)
+                edge = edge_base + slot
+                valid = edge < edge_end
+                qid = Int32(0)
+                if valid:
+                    qid = query_ids[edge]
+                main_head = proxy_head * Int32(self.main_per_proxy) + head_off
+                value_q = q.element_type(0.0)
+                value_do = q.element_type(0.0)
+                if valid:
+                    value_q = q[batch_idx, main_head, qid, col]
+                    value_do = grad_o[batch_idx, main_head, qid, col]
+                sQ[qr, col] = value_q
+                sdO[qr, col] = value_do
+                linear += Int32(128)
+            cute.arch.sync_threads()
+
+            thr_sdp = mma_sdp.get_slice(tidx)
+            _, q_frag, k_frag = sm90_utils.partition_fragment_ABC(
+                thr_sdp, (64, 64, 128), sQ, sK
+            )
+            scores = sm90_utils.gemm_zero_init(mma_sdp, (64, 64), q_frag, k_frag, wg_wait=0)
+            _, do_frag, v_frag = sm90_utils.partition_fragment_ABC(
+                thr_sdp, (64, 64, 128), sdO, sV
+            )
+            dp = sm90_utils.gemm_zero_init(mma_sdp, (64, 64), do_frag, v_frag, wg_wait=0)
+            coords = thr_sdp.partition_C(cute.make_identity_tensor((64, 64)))
+            coords_mn = cute.make_tensor(coords.iterator, _layout_acc_mn(mma_sdp, coords.layout))
+            scores_mn = cute.make_tensor(scores.iterator, _layout_acc_mn(mma_sdp, scores.layout))
+            dp_mn = cute.make_tensor(dp.iterator, _layout_acc_mn(mma_sdp, dp.layout))
+            for ri in cutlass.range_constexpr(cute.size(scores_mn, mode=[0])):
+                for ci in cutlass.range_constexpr(cute.size(scores_mn, mode=[1])):
+                    coord = coords_mn[ri, ci]
+                    qr, kc = coord[0], coord[1]
+                    slot = qr // Int32(self.main_per_proxy)
+                    head_off = qr - slot * Int32(self.main_per_proxy)
+                    edge = edge_base + slot
+                    valid = edge < edge_end
+                    qid = Int32(0)
+                    if valid:
+                        qid = query_ids[edge]
+                    main_head = proxy_head * Int32(self.main_per_proxy) + head_off
+                    valid = valid and key_start + kc <= qid
+                    probability = Float32(0.0)
+                    ds_value = Float32(0.0)
+                    if valid:
+                        probability = cute.math.exp(
+                            scores_mn[ri, ci] * scale - lse[batch_idx, main_head, qid],
+                            fastmath=True,
+                        )
+                        ds_value = probability * (
+                            dp_mn[ri, ci] - delta[batch_idx, main_head, qid]
+                        ) * scale
+                    sP[qr, kc] = q.element_type(probability)
+                    sdS[qr, kc] = q.element_type(ds_value)
+            cute.arch.sync_threads()
+
+            sPt = layout_utils.transpose_view(sP)
+            sdSt = layout_utils.transpose_view(sdS)
+            sQt = layout_utils.transpose_view(sQ)
+            sdOt = layout_utils.transpose_view(sdO)
+            sKt = layout_utils.transpose_view(sK)
+            _, p_frag, do_t_frag = sm90_utils.partition_fragment_ABC(
+                thr_dkv, (64, 128, 64), sPt, sdOt
+            )
+            sm90_utils.gemm_w_idx(mma_dkv, acc_dv, p_frag, do_t_frag, zero_init=False, wg_wait=0)
+            _, ds_t_frag, q_t_frag = sm90_utils.partition_fragment_ABC(
+                thr_dkv, (64, 128, 64), sdSt, sQt
+            )
+            sm90_utils.gemm_w_idx(mma_dkv, acc_dk, ds_t_frag, q_t_frag, zero_init=False, wg_wait=0)
+            thr_dq = mma_dq.get_slice(tidx)
+            _, ds_frag, k_t_frag = sm90_utils.partition_fragment_ABC(
+                thr_dq, (64, 128, 64), sdS, sKt
+            )
+            acc_dq = sm90_utils.gemm_zero_init(
+                mma_dq, (64, 128), ds_frag, k_t_frag, wg_wait=0
+            )
+            dq_coords = thr_dq.partition_C(cute.make_identity_tensor((64, 128)))
+            dq_coords_mn = cute.make_tensor(
+                dq_coords.iterator, _layout_acc_mn(mma_dq, dq_coords.layout)
+            )
+            dq_values_mn = cute.make_tensor(
+                acc_dq.iterator, _layout_acc_mn(mma_dq, acc_dq.layout)
+            )
+            for ri in cutlass.range_constexpr(cute.size(dq_values_mn, mode=[0])):
+                for ci in cutlass.range_constexpr(cute.size(dq_values_mn, mode=[1])):
+                    coord = dq_coords_mn[ri, ci]
+                    qr = coord[0]
+                    slot = qr // Int32(self.main_per_proxy)
+                    head_off = qr - slot * Int32(self.main_per_proxy)
+                    edge = edge_base + slot
+                    if edge < edge_end:
+                        qid = query_ids[edge]
+                        main_head = proxy_head * Int32(self.main_per_proxy) + head_off
+                        _atomic_add_fp32(
+                            dq_values_mn[ri, ci],
+                            _elem_pointer(dq, (batch_idx, main_head, qid, coord[1])),
+                        )
+            cute.arch.sync_threads()
+            edge_base += Int32(self.queries_per_group)
+
+        dkv_coords_mn = cute.make_tensor(
+            c_dkv.iterator, _layout_acc_mn(mma_dkv, c_dkv.layout)
+        )
+        dk_values_mn = cute.make_tensor(acc_dk.iterator, _layout_acc_mn(mma_dkv, acc_dk.layout))
+        dv_values_mn = cute.make_tensor(acc_dv.iterator, _layout_acc_mn(mma_dkv, acc_dv.layout))
+        for ri in cutlass.range_constexpr(cute.size(dk_values_mn, mode=[0])):
+            for ci in cutlass.range_constexpr(cute.size(dk_values_mn, mode=[1])):
+                coord = dkv_coords_mn[ri, ci]
+                target = (batch_idx, kv_head, key_start + coord[0], coord[1])
+                _atomic_add_fp32(dk_values_mn[ri, ci], _elem_pointer(dk, target))
+                _atomic_add_fp32(dv_values_mn[ri, ci], _elem_pointer(dv, target))
+
+
 def wgmma_backward_dq(ds: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
     """Validate the native ``dS @ K`` product on one 64x128 Hopper tile."""
 
@@ -449,4 +694,77 @@ def wgmma_backward_attention_tile(
     return dq, dk, dv
 
 
-__all__ = ["wgmma_backward_attention_tile", "wgmma_backward_dq"]
+def wgmma_kv_row_backward_main(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    grad_out: torch.Tensor,
+    lse: torch.Tensor,
+    delta: torch.Tensor,
+    row_ptr: torch.Tensor,
+    query_ids: torch.Tensor,
+    *,
+    n_proxy_heads: int,
+    scale: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Run the fixed-length KV-stationary reverse-CSR main backward."""
+
+    if q.device.type != "cuda" or torch.cuda.get_device_capability(q.device) != (9, 0):
+        raise RuntimeError("KV-row backward requires a compute capability 9.0 GPU")
+    if q.ndim != 4 or k.ndim != 4 or v.shape != k.shape or grad_out.shape != q.shape:
+        raise ValueError("Q/dO and K/V must be matching [B,H,S,D] tensors")
+    batch, n_heads, seq_len, dim = q.shape
+    if dim != 128 or seq_len % 128:
+        raise NotImplementedError("KV-row backward currently requires D=128 and S divisible by 128")
+    if any(t.device != q.device for t in (k, v, grad_out, lse, delta, row_ptr, query_ids)):
+        raise ValueError("all KV-row backward tensors must share one CUDA device")
+    if any(t.dtype != q.dtype for t in (k, v, grad_out)) or q.dtype not in (
+        torch.float16, torch.bfloat16
+    ):
+        raise TypeError("Q/K/V/dO must have one fp16/bf16 dtype")
+    if lse.shape != (batch, n_heads, seq_len) or delta.shape != lse.shape:
+        raise ValueError("LSE and delta must have shape [B,H,S]")
+    if lse.dtype != torch.float32 or delta.dtype != torch.float32:
+        raise TypeError("LSE and delta must be FP32")
+    if row_ptr.dtype != torch.int32 or query_ids.dtype != torch.int32:
+        raise TypeError("reverse-CSR tensors must be int32")
+    n_kv_heads = k.shape[1]
+    n_proxy_heads = int(n_proxy_heads)
+    if n_heads % n_proxy_heads or n_proxy_heads % n_kv_heads:
+        raise NotImplementedError("head counts must satisfy H % Hp == 0 and Hp % Hkv == 0")
+    main_per_proxy = n_heads // n_proxy_heads
+    if 64 % main_per_proxy:
+        raise NotImplementedError("main heads per proxy must divide 64")
+    expected_rows = batch * n_proxy_heads * (seq_len // 128)
+    if row_ptr.numel() != expected_rows + 1:
+        raise ValueError(f"row_ptr must have {expected_rows + 1} entries")
+
+    packed = tuple(t.detach().contiguous() for t in (q, k, v, grad_out))
+    lse_c = lse.detach().to(torch.float32).contiguous()
+    delta_c = delta.detach().to(torch.float32).contiguous()
+    row_ptr_c = row_ptr.detach().contiguous()
+    query_ids_c = query_ids.detach().contiguous()
+    dq = torch.zeros_like(q, dtype=torch.float32)
+    dk = torch.zeros_like(k, dtype=torch.float32)
+    dv = torch.zeros_like(v, dtype=torch.float32)
+    args = tuple(
+        _to_cute_tensor(t)
+        for t in (*packed, lse_c, delta_c, row_ptr_c, query_ids_c, dq, dk, dv)
+    )
+    stream = cuda.CUstream(torch.cuda.current_stream(q.device).cuda_stream)
+    key = (
+        "kv_row_backward_main", args[0].element_type, batch, n_heads,
+        n_kv_heads, n_proxy_heads, seq_len,
+    )
+    if key not in _COMPILE_CACHE:
+        kernel = _KVRowBackwardKernel(batch, n_heads, n_kv_heads, n_proxy_heads, seq_len)
+        _COMPILE_CACHE[key] = cute.compile(kernel, *args, float(scale), stream)
+    _COMPILE_CACHE[key](*args, float(scale), stream)
+    return dq, dk, dv
+
+
+__all__ = [
+    "wgmma_backward_attention_tile",
+    "wgmma_backward_dq",
+    "wgmma_kv_row_backward_main",
+]
