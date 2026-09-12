@@ -10,12 +10,20 @@ The work follows two rules:
 
 1. Optimize from measured bottlenecks, not assumed bottlenecks.
 2. Land each major milestone as an independently revertible git commit.
+3. Design every optimization for both fixed-length and varlen/document-masked
+   execution, even when the fixed-length implementation is delivered first.
 
 ## Target and non-goals
 
 Target hardware is GH200 (Hopper, compute capability 9.0) with head dimension
 128 and block size 128. The first target is training; inference-only changes may
 be developed when they share useful infrastructure.
+
+Implementation proceeds in two phases. First, optimize the normal fixed-length
+path, where uniform full blocks make performance behavior easier to isolate.
+After that path reaches its target, port the same scheduling, data movement, MMA,
+and fusion design to varlen/document-masked execution. Fixed-length work must not
+remove or bypass the existing varlen implementation.
 
 Blackwell-only TCGen05/UMMA, tensor memory (TMEM), NVFP4, and Cluster Launch
 Control are not portable to GH200. Portable ideas from the MiniMax SM100 kernel
@@ -33,6 +41,18 @@ Every optimization must pass:
 - non-document-masked regression tests;
 - finite-value checks and configured output/gradient tolerances;
 - BF16 baseline comparison before any FP8-specific tolerance is introduced.
+
+Each fixed-length optimization must also document its varlen adaptation:
+
+- which tensors become segment-aware;
+- how partial first/last document blocks are predicated;
+- how batch-row boundaries enter scheduling;
+- which fast path remains valid for full aligned document segments;
+- whether metadata or workspace formats remain shared between both paths.
+
+An optimization is not considered complete project-wide until both paths use it,
+but the fixed-length implementation and its later varlen port should be separate
+rollback commits.
 
 Performance results must report warmup policy, shape, dtype, Top-K, GPU, software
 versions, median latency, dispersion, and peak allocated memory. JIT compilation
@@ -66,6 +86,10 @@ metadata for compatible shapes, and fuse adjacent metadata operations.
 
 Exit criteria: unchanged correctness and a measured end-to-end improvement for
 at least two representative document-masked shapes.
+
+Implementation order: first fuse/reduce overhead in the fixed-length path, then
+extend the same metadata representation and launch structure to document
+segments without regressing its aligned-block fast path.
 
 ## Milestone 2: native SM90a KV-outer BF16 forward
 
@@ -148,3 +172,7 @@ At minimum, measure:
 Optimization commits must include the benchmark command and before/after result
 in their commit message or an accompanying performance note.
 
+During the fixed-length phase, every benchmark change is measured first without
+masking. Document-masked regression tests continue to run after every commit so
+normal-path work cannot silently break varlen behavior. A matching varlen
+performance matrix is required when the porting phase begins.
