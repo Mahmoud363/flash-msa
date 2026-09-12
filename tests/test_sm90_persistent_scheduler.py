@@ -7,6 +7,7 @@ from flash_msa.msa_forward_sm90 import (
     persistent_claim_work,
     tma_load_selected_kv,
     wgmma_selected_qk,
+    wgmma_selected_softmax,
 )
 
 
@@ -70,3 +71,28 @@ def test_selected_qk_uses_wgmma_fp32_accumulation() -> None:
     gathered_q = q[0, 4:8, qids.long()].permute(1, 0, 2).reshape(64, 128)
     reference = gathered_q.float() @ k[0, 0, 128:256].float().T
     torch.testing.assert_close(scores[0], reference, rtol=2e-3, atol=0.2)
+
+
+def test_selected_qk_softmax_stays_in_fp32() -> None:
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (9, 0):
+        pytest.skip("SM90 test")
+    torch.manual_seed(29)
+    q = torch.randn(1, 16, 512, 128, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(1, 2, 512, 128, device="cuda", dtype=torch.bfloat16)
+    qids = torch.arange(257, 273, dtype=torch.int32, device="cuda")
+    task_meta = torch.tensor(
+        [[0, 2, 0, 16, 0]], dtype=torch.int32, device="cuda"
+    )
+    scale = 128**-0.5
+    probabilities, lse = wgmma_selected_softmax(
+        q, k, task_meta, qids, n_proxy_heads=4, scale=scale
+    )
+    torch.cuda.synchronize()
+    gathered_q = q[0, 8:12, qids.long()].permute(1, 0, 2).reshape(64, 128)
+    logits = (gathered_q.float() @ k[0, 1, :128].float().T) * scale
+    torch.testing.assert_close(
+        probabilities[0], logits.softmax(dim=-1), rtol=3e-3, atol=3e-4
+    )
+    torch.testing.assert_close(
+        lse[0], logits.logsumexp(dim=-1), rtol=3e-3, atol=3e-3
+    )

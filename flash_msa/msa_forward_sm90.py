@@ -15,6 +15,7 @@ import torch
 from cuda.bindings import driver as cuda
 from cutlass import Int32, cute
 from cutlass._mlir.dialects import nvvm
+from cutlass._mlir.dialects import math as _math
 from cutlass.cute.runtime import from_dlpack
 from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass import pipeline
@@ -377,6 +378,89 @@ class _SelectedQKWgmmaKernel:
                 acc,
             )
 
+    @staticmethod
+    def _layout_separate(threshold, source, reference):
+        lower = cute.make_layout(())
+        upper = cute.make_layout(())
+        for index, value in enumerate(reference):
+            if cutlass.const_expr(value < threshold):
+                lower = cute.append(lower, source[index])
+            else:
+                upper = cute.append(upper, source[index])
+        if cutlass.const_expr(cute.rank(lower) == 1):
+            return cute.append(lower, upper)
+        return cute.append(cute.append(cute.make_layout(()), lower), upper)
+
+    @cute.jit
+    def _layout_acc_mn(self, tiled_mma, accumulator):
+        separated = self._layout_separate(
+            tiled_mma.shape_mnk[0],
+            accumulator[0],
+            tiled_mma.tv_layout_C.stride[1],
+        )
+        values_m, values_n = separated[0], separated[1]
+        if cutlass.const_expr(cute.rank(values_m) == 1):
+            values_m = cute.append(values_m, accumulator[1])
+        else:
+            values_m = cute.append(
+                cute.append(cute.make_layout(()), values_m), accumulator[1]
+            )
+        if cutlass.const_expr(cute.rank(values_n) == 1):
+            values_n = cute.append(values_n, accumulator[2])
+        else:
+            values_n = cute.append(
+                cute.append(cute.make_layout(()), values_n), accumulator[2]
+            )
+        if cutlass.const_expr(cute.rank(values_m) == 1):
+            return cute.append(values_m, values_n)
+        return cute.append(cute.append(cute.make_layout(()), values_m), values_n)
+
+    @cute.jit
+    def _reduction_target_n(self, tiled_mma):
+        separated = self._layout_separate(
+            tiled_mma.shape_mnk[0],
+            cute.make_layout(tiled_mma.tv_layout_C.shape[0]),
+            tiled_mma.tv_layout_C.stride[0],
+        )
+        return separated[1]
+
+    @cute.jit
+    def _softmax_fp32(self, acc, tiled_mma, scale_log2):
+        """Normalize one WGMMA score tile and return per-row max/sum."""
+
+        acc_mn = cute.make_tensor(
+            acc.iterator, self._layout_acc_mn(tiled_mma, acc.layout)
+        )
+        row_shape = cute.make_layout(cute.size(acc_mn, mode=[0]))
+        row_max = cute.make_rmem_tensor_like(row_shape, cutlass.Float32)
+        row_sum = cute.make_rmem_tensor_like(row_shape, cutlass.Float32)
+        reduction_target = self._reduction_target_n(tiled_mma)
+        reduction_rank = cute.rank(reduction_target)
+        for row in cutlass.range_constexpr(cute.size(acc_mn, mode=[0])):
+            row_max[row] = acc_mn[row, 0]
+            for col in cutlass.range_constexpr(1, cute.size(acc_mn, mode=[1])):
+                row_max[row] = cute.arch.fmax(row_max[row], acc_mn[row, col])
+            for reduction in cutlass.range_constexpr(reduction_rank):
+                row_max[row] = cute.arch.warp_reduction_max(
+                    row_max[row], threads_in_group=reduction_target.shape[reduction]
+                )
+            scaled_max = scale_log2 * row_max[row]
+            for col in cutlass.range_constexpr(cute.size(acc_mn, mode=[1])):
+                acc_mn[row, col] = cute.math.exp2(
+                    scale_log2 * acc_mn[row, col] - scaled_max, fastmath=True
+                )
+            row_sum[row] = acc_mn[row, None].load().reduce(
+                cute.ReductionOp.ADD, cutlass.Float32.zero, 0
+            )
+            for reduction in cutlass.range_constexpr(reduction_rank):
+                row_sum[row] = cute.arch.warp_reduction_sum(
+                    row_sum[row], threads_in_group=reduction_target.shape[reduction]
+                )
+            inv_sum = cute.arch.rcp_approx(row_sum[row])
+            for col in cutlass.range_constexpr(cute.size(acc_mn, mode=[1])):
+                acc_mn[row, col] *= inv_sum
+        return row_max, row_sum
+
     @cute.jit
     def __call__(
         self,
@@ -385,6 +469,9 @@ class _SelectedQKWgmmaKernel:
         task_meta: cute.Tensor,
         query_indices: cute.Tensor,
         scores: cute.Tensor,
+        probabilities: cute.Tensor,
+        lse: cute.Tensor,
+        scale: cutlass.Float32,
         stream: cuda.CUstream,
     ):
         batch, n_heads, seq_len, head_dim = q.shape
@@ -455,6 +542,10 @@ class _SelectedQKWgmmaKernel:
             task_meta,
             query_indices,
             scores,
+            probabilities,
+            lse,
+            scale * cutlass.Float32(1.4426950408889634),
+            scale,
             tiled_mma,
             q_smem_staged,
             k_smem_staged,
@@ -474,6 +565,10 @@ class _SelectedQKWgmmaKernel:
         task_meta: cute.Tensor,
         query_indices: cute.Tensor,
         scores: cute.Tensor,
+        probabilities: cute.Tensor,
+        lse: cute.Tensor,
+        scale_log2: cutlass.Float32,
+        scale: cutlass.Float32,
         tiled_mma: cute.TiledMma,
         q_smem_staged: cute.ComposedLayout,
         k_smem_staged: cute.ComposedLayout,
@@ -579,6 +674,24 @@ class _SelectedQKWgmmaKernel:
             tCg = thr_mma.partition_C(g_scores)
             for i in cutlass.range_constexpr(cute.size(acc)):
                 tCg[i] = acc[i]
+            row_max, row_sum = self._softmax_fp32(acc, tiled_mma, scale_log2)
+            g_probabilities = probabilities[task_idx, None, None]
+            tPg = thr_mma.partition_C(g_probabilities)
+            for i in cutlass.range_constexpr(cute.size(acc)):
+                tPg[i] = acc[i]
+
+            coordinates = cute.make_identity_tensor((self.rows, self.block))
+            tCoordinates = thr_mma.partition_C(coordinates)
+            coordinates_mn = cute.make_tensor(
+                tCoordinates.iterator,
+                self._layout_acc_mn(tiled_mma, tCoordinates.layout),
+            )
+            for row in cutlass.range_constexpr(cute.size(row_max)):
+                coordinate = coordinates_mn[row, 0]
+                if coordinate[1] == 0:
+                    lse[task_idx, coordinate[0]] = (
+                        row_max[row] * scale + _math.log(row_sum[row])
+                    )
 
 
 def wgmma_selected_qk(
@@ -605,6 +718,8 @@ def wgmma_selected_qk(
         raise TypeError("schedule tensors must be int32")
     num_tasks = int(task_meta.shape[0])
     scores = torch.empty((num_tasks, 64, 128), device=q.device, dtype=torch.float32)
+    probabilities = torch.empty_like(scores)
+    lse = torch.empty((num_tasks, 64), device=q.device, dtype=torch.float32)
     if num_tasks == 0:
         return scores
     q_cute = _to_cute_tensor(q.detach().contiguous())
@@ -612,6 +727,8 @@ def wgmma_selected_qk(
     meta_cute = _to_cute_tensor(task_meta.contiguous())
     qids_cute = _to_cute_tensor(query_indices.contiguous())
     scores_cute = _to_cute_tensor(scores)
+    probabilities_cute = _to_cute_tensor(probabilities)
+    lse_cute = _to_cute_tensor(lse)
     stream = cuda.CUstream(torch.cuda.current_stream(q.device).cuda_stream)
     main_per_proxy = int(q.shape[1]) // int(n_proxy_heads)
     proxy_per_kv = int(n_proxy_heads) // int(k.shape[1])
@@ -619,10 +736,90 @@ def wgmma_selected_qk(
     if key not in _COMPILE_CACHE:
         kernel = _SelectedQKWgmmaKernel(num_tasks, main_per_proxy, proxy_per_kv)
         _COMPILE_CACHE[key] = cute.compile(
-            kernel, q_cute, k_cute, meta_cute, qids_cute, scores_cute, stream
+            kernel,
+            q_cute,
+            k_cute,
+            meta_cute,
+            qids_cute,
+            scores_cute,
+            probabilities_cute,
+            lse_cute,
+            1.0,
+            stream,
         )
-    _COMPILE_CACHE[key](q_cute, k_cute, meta_cute, qids_cute, scores_cute, stream)
+    _COMPILE_CACHE[key](
+        q_cute,
+        k_cute,
+        meta_cute,
+        qids_cute,
+        scores_cute,
+        probabilities_cute,
+        lse_cute,
+        1.0,
+        stream,
+    )
     return scores
 
 
-__all__ = ["persistent_claim_work", "tma_load_selected_kv", "wgmma_selected_qk"]
+def wgmma_selected_softmax(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    task_meta: torch.Tensor,
+    query_indices: torch.Tensor,
+    *,
+    n_proxy_heads: int,
+    scale: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return FP32 normalized probabilities and LSE from fused QK/softmax."""
+
+    num_tasks = int(task_meta.shape[0])
+    scores = torch.empty((num_tasks, 64, 128), device=q.device, dtype=torch.float32)
+    probabilities = torch.empty_like(scores)
+    lse = torch.empty((num_tasks, 64), device=q.device, dtype=torch.float32)
+    if num_tasks == 0:
+        return probabilities, lse
+    q_cute = _to_cute_tensor(q.detach().contiguous())
+    k_cute = _to_cute_tensor(k.detach().contiguous())
+    meta_cute = _to_cute_tensor(task_meta.contiguous())
+    qids_cute = _to_cute_tensor(query_indices.contiguous())
+    scores_cute = _to_cute_tensor(scores)
+    probabilities_cute = _to_cute_tensor(probabilities)
+    lse_cute = _to_cute_tensor(lse)
+    stream = cuda.CUstream(torch.cuda.current_stream(q.device).cuda_stream)
+    main_per_proxy = int(q.shape[1]) // int(n_proxy_heads)
+    proxy_per_kv = int(n_proxy_heads) // int(k.shape[1])
+    key = ("selected_qk_wgmma", num_tasks, main_per_proxy, proxy_per_kv, q_cute.element_type)
+    if key not in _COMPILE_CACHE:
+        kernel = _SelectedQKWgmmaKernel(num_tasks, main_per_proxy, proxy_per_kv)
+        _COMPILE_CACHE[key] = cute.compile(
+            kernel,
+            q_cute,
+            k_cute,
+            meta_cute,
+            qids_cute,
+            scores_cute,
+            probabilities_cute,
+            lse_cute,
+            float(scale),
+            stream,
+        )
+    _COMPILE_CACHE[key](
+        q_cute,
+        k_cute,
+        meta_cute,
+        qids_cute,
+        scores_cute,
+        probabilities_cute,
+        lse_cute,
+        float(scale),
+        stream,
+    )
+    return probabilities, lse
+
+
+__all__ = [
+    "persistent_claim_work",
+    "tma_load_selected_kv",
+    "wgmma_selected_qk",
+    "wgmma_selected_softmax",
+]
