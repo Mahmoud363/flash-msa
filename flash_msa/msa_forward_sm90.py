@@ -19,6 +19,8 @@ from cutlass.cute.runtime import from_dlpack
 from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass import pipeline
 from cutlass.cute.nvgpu import warpgroup
+import cutlass.utils as utils
+import cutlass.utils.hopper_helpers as sm90_utils
 
 
 _COMPILE_CACHE = {}
@@ -351,4 +353,276 @@ def tma_load_selected_kv(
     return copied_k, copied_v
 
 
-__all__ = ["persistent_claim_work", "tma_load_selected_kv"]
+class _SelectedQKWgmmaKernel:
+    """One selected 64x128 QK tile using warp-specialized TMA/WGMMA."""
+
+    rows = 64
+    block = 128
+
+    def __init__(self, num_tasks: int, main_per_proxy: int, proxy_per_kv: int) -> None:
+        self.num_tasks = int(num_tasks)
+        self.main_per_proxy = int(main_per_proxy)
+        self.proxy_per_kv = int(proxy_per_kv)
+
+    @staticmethod
+    @cute.jit
+    def _gemm_zero(tiled_mma, a, b, acc):
+        for k_block in range(cute.size(a, mode=[2]), unroll_full=True):
+            tiled_mma.set(warpgroup.Field.ACCUMULATE, k_block != 0)
+            cute.gemm(
+                tiled_mma,
+                acc,
+                a[None, None, k_block],
+                b[None, None, k_block],
+                acc,
+            )
+
+    @cute.jit
+    def __call__(
+        self,
+        q: cute.Tensor,
+        k: cute.Tensor,
+        task_meta: cute.Tensor,
+        query_indices: cute.Tensor,
+        scores: cute.Tensor,
+        stream: cuda.CUstream,
+    ):
+        batch, n_heads, seq_len, head_dim = q.shape
+        _, n_kv_heads, _, _ = k.shape
+        q_layout = cute.make_layout(
+            (seq_len, head_dim, n_heads, batch),
+            stride=(
+                head_dim,
+                1,
+                seq_len * head_dim,
+                n_heads * seq_len * head_dim,
+            ),
+        )
+        kv_layout = cute.make_layout(
+            (seq_len, head_dim, n_kv_heads, batch),
+            stride=(
+                head_dim,
+                1,
+                seq_len * head_dim,
+                n_kv_heads * seq_len * head_dim,
+            ),
+        )
+        q = cute.make_tensor(q.iterator, q_layout)
+        k = cute.make_tensor(k.iterator, kv_layout)
+        dtype = q.element_type
+        q_layout_enum = utils.LayoutEnum.from_tensor(q)
+        k_layout_enum = utils.LayoutEnum.from_tensor(k)
+        tiled_mma = sm90_utils.make_trivial_tiled_mma(
+            dtype,
+            dtype,
+            q_layout_enum.sm90_mma_major_mode(),
+            k_layout_enum.sm90_mma_major_mode(),
+            cutlass.Float32,
+            (1, 1, 1),
+            (self.rows, self.block),
+        )
+        q_smem_staged = sm90_utils.make_smem_layout_a(
+            q_layout_enum, (self.rows, self.block, head_dim), dtype, 1
+        )
+        k_smem_staged = sm90_utils.make_smem_layout_b(
+            k_layout_enum, (self.rows, self.block, head_dim), dtype, 1
+        )
+        k_smem = cute.slice_(k_smem_staged, (None, None, 0))
+        tma_k, tensor_k = cute.nvgpu.cpasync.make_tiled_tma_atom(
+            cute.nvgpu.cpasync.CopyBulkTensorTileG2SOp(),
+            k,
+            k_smem,
+            (self.block, head_dim),
+        )
+        self._dtype = dtype
+        self._tma_bytes = cute.size_in_bytes(dtype, k_smem)
+
+        @cute.struct
+        class SharedStorage:
+            k_barriers: cute.struct.MemRange[cutlass.Int64, 2]
+            sQ: cute.struct.Align[
+                cute.struct.MemRange[dtype, cute.cosize(q_smem_staged)], 1024
+            ]
+            sK: cute.struct.Align[
+                cute.struct.MemRange[dtype, cute.cosize(k_smem_staged)], 1024
+            ]
+
+        self.shared_storage = SharedStorage
+        self.kernel(
+            q,
+            tma_k,
+            tensor_k,
+            task_meta,
+            query_indices,
+            scores,
+            tiled_mma,
+            q_smem_staged,
+            k_smem_staged,
+        ).launch(
+            grid=[self.num_tasks, 1, 1],
+            block=[256, 1, 1],
+            smem=SharedStorage.size_in_bytes(),
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        q: cute.Tensor,
+        tma_k: cute.CopyAtom,
+        k: cute.Tensor,
+        task_meta: cute.Tensor,
+        query_indices: cute.Tensor,
+        scores: cute.Tensor,
+        tiled_mma: cute.TiledMma,
+        q_smem_staged: cute.ComposedLayout,
+        k_smem_staged: cute.ComposedLayout,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        task_idx, _, _ = cute.arch.block_idx()
+        warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+        warpgroup_idx = cute.arch.make_warp_uniform(tidx // Int32(128))
+
+        smem = utils.SmemAllocator()
+        storage = smem.allocate(self.shared_storage)
+        sQ = storage.sQ.get_tensor(
+            q_smem_staged.outer, swizzle=q_smem_staged.inner
+        )
+        sK = storage.sK.get_tensor(
+            k_smem_staged.outer, swizzle=k_smem_staged.inner
+        )
+        producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
+        consumer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread, 4)
+        k_pipe = pipeline.PipelineTmaAsync.create(
+            barrier_storage=storage.k_barriers.data_ptr(),
+            num_stages=1,
+            producer_group=producer_group,
+            consumer_group=consumer_group,
+            tx_count=self._tma_bytes,
+        )
+
+        batch = task_meta[task_idx, 0]
+        proxy_head = task_meta[task_idx, 1]
+        key_block = task_meta[task_idx, 2]
+        query_count = task_meta[task_idx, 3]
+        edge_offset = task_meta[task_idx, 4]
+        kv_head = proxy_head // Int32(self.proxy_per_kv)
+
+        gK = cute.local_tile(
+            k[None, None, kv_head, batch],
+            (self.block, self.block),
+            (None, 0),
+        )
+        tKsK, tKgK = cute.nvgpu.cpasync.tma_partition(
+            tma_k,
+            0,
+            cute.make_layout(1),
+            cute.group_modes(sK, 0, 2),
+            cute.group_modes(gK, 0, 2),
+        )
+        producer_state = pipeline.make_pipeline_state(
+            pipeline.PipelineUserType.Producer, 1
+        )
+        consumer_state = pipeline.make_pipeline_state(
+            pipeline.PipelineUserType.Consumer, 1
+        )
+
+        if warp_idx == 0:
+            k_pipe.producer_acquire(producer_state)
+            cute.copy(
+                tma_k,
+                tKgK[(None, key_block)],
+                tKsK[(None, 0)],
+                tma_bar_ptr=k_pipe.producer_get_barrier(producer_state),
+            )
+            k_pipe.producer_commit(producer_state)
+
+        # Producer warpgroup gathers arbitrary CSR query IDs into the WGMMA
+        # shared-memory A layout while the TMA engine transfers K.
+        if warpgroup_idx == 0:
+            linear = tidx
+            while linear < Int32(self.rows * self.block):
+                row = linear // Int32(self.block)
+                col = linear - row * Int32(self.block)
+                query_slot = row // Int32(self.main_per_proxy)
+                main_offset = row - query_slot * Int32(self.main_per_proxy)
+                valid = query_slot < query_count
+                qid = Int32(0)
+                if valid:
+                    qid = query_indices[edge_offset + query_slot]
+                head = proxy_head * Int32(self.main_per_proxy) + main_offset
+                sQ[row, col, 0] = q[qid, col, head, batch] if valid else self._dtype(0)
+                linear += Int32(128)
+        cute.arch.sync_threads()
+
+        if warpgroup_idx == 1:
+            cute.arch.setmaxregister_increase(232)
+            k_pipe.consumer_wait(consumer_state)
+            wg_thread = tidx - Int32(128)
+            thr_mma = tiled_mma.get_slice(wg_thread)
+            tSsQ = thr_mma.partition_A(sQ)
+            tSsK = thr_mma.partition_B(sK)
+            tSrQ = thr_mma.make_fragment_A(tSsQ)
+            tSrK = thr_mma.make_fragment_B(tSsK)
+            acc_shape = thr_mma.partition_shape_C((self.rows, self.block))
+            acc = thr_mma.make_fragment_C(acc_shape)
+            cute.nvgpu.warpgroup.fence()
+            self._gemm_zero(
+                tiled_mma,
+                tSrQ[(None, None, None, 0)],
+                tSrK[(None, None, None, 0)],
+                acc,
+            )
+            cute.nvgpu.warpgroup.commit_group()
+            cute.nvgpu.warpgroup.wait_group(0)
+            g_scores = scores[task_idx, None, None]
+            tCg = thr_mma.partition_C(g_scores)
+            for i in cutlass.range_constexpr(cute.size(acc)):
+                tCg[i] = acc[i]
+
+
+def wgmma_selected_qk(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    task_meta: torch.Tensor,
+    query_indices: torch.Tensor,
+    *,
+    n_proxy_heads: int,
+) -> torch.Tensor:
+    """Compute selected 64x128 QK score tiles with Hopper WGMMA."""
+
+    if q.ndim != 4 or k.ndim != 4 or q.shape[-1] != 128 or k.shape[-1] != 128:
+        raise ValueError("q and k must have shapes [B,H,S,128]")
+    if q.dtype != k.dtype or q.dtype not in (torch.float16, torch.bfloat16):
+        raise TypeError("q and k must have matching fp16/bf16 dtypes")
+    if q.device.type != "cuda" or k.device != q.device:
+        raise ValueError("q and k must be on the same CUDA device")
+    if q.shape[0] != k.shape[0] or q.shape[2] != k.shape[2]:
+        raise ValueError("q and k batch/sequence dimensions must match")
+    if q.shape[1] % n_proxy_heads or n_proxy_heads % k.shape[1]:
+        raise ValueError("invalid main/proxy/KV head divisibility")
+    if task_meta.dtype != torch.int32 or query_indices.dtype != torch.int32:
+        raise TypeError("schedule tensors must be int32")
+    num_tasks = int(task_meta.shape[0])
+    scores = torch.empty((num_tasks, 64, 128), device=q.device, dtype=torch.float32)
+    if num_tasks == 0:
+        return scores
+    q_cute = _to_cute_tensor(q.detach().contiguous())
+    k_cute = _to_cute_tensor(k.detach().contiguous())
+    meta_cute = _to_cute_tensor(task_meta.contiguous())
+    qids_cute = _to_cute_tensor(query_indices.contiguous())
+    scores_cute = _to_cute_tensor(scores)
+    stream = cuda.CUstream(torch.cuda.current_stream(q.device).cuda_stream)
+    main_per_proxy = int(q.shape[1]) // int(n_proxy_heads)
+    proxy_per_kv = int(n_proxy_heads) // int(k.shape[1])
+    key = ("selected_qk_wgmma", num_tasks, main_per_proxy, proxy_per_kv, q_cute.element_type)
+    if key not in _COMPILE_CACHE:
+        kernel = _SelectedQKWgmmaKernel(num_tasks, main_per_proxy, proxy_per_kv)
+        _COMPILE_CACHE[key] = cute.compile(
+            kernel, q_cute, k_cute, meta_cute, qids_cute, scores_cute, stream
+        )
+    _COMPILE_CACHE[key](q_cute, k_cute, meta_cute, qids_cute, scores_cute, stream)
+    return scores
+
+
+__all__ = ["persistent_claim_work", "tma_load_selected_kv", "wgmma_selected_qk"]
