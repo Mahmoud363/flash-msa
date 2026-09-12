@@ -676,6 +676,7 @@ class _SelectedQKWgmmaKernel:
         persistent: bool = False,
         num_ctas: int | None = None,
         fp8_kv: bool = False,
+        segmented: bool = False,
     ) -> None:
         self.num_tasks = int(num_tasks)
         self.main_per_proxy = int(main_per_proxy)
@@ -683,6 +684,7 @@ class _SelectedQKWgmmaKernel:
         self.write_debug = bool(write_debug)
         self.persistent = bool(persistent)
         self.fp8_kv = bool(fp8_kv)
+        self.segmented = bool(segmented)
         self.num_ctas = int(num_ctas if num_ctas is not None else num_tasks)
         self.claims_per_cta = (self.num_tasks + self.num_ctas - 1) // self.num_ctas
 
@@ -829,6 +831,8 @@ class _SelectedQKWgmmaKernel:
         q_scale: cute.Tensor,
         k_scale: cute.Tensor,
         v_scale: cute.Tensor,
+        segment_starts: cute.Tensor,
+        segment_lengths: cute.Tensor,
         scale: cutlass.Float32,
         stream: cuda.CUstream,
     ):
@@ -1007,6 +1011,8 @@ class _SelectedQKWgmmaKernel:
             q_scale,
             k_scale,
             v_scale,
+            segment_starts,
+            segment_lengths,
             scale * cutlass.Float32(1.4426950408889634),
             scale,
             tiled_mma,
@@ -1042,6 +1048,8 @@ class _SelectedQKWgmmaKernel:
         q_scale: cute.Tensor,
         k_scale: cute.Tensor,
         v_scale: cute.Tensor,
+        segment_starts: cute.Tensor,
+        segment_lengths: cute.Tensor,
         scale_log2: cutlass.Float32,
         scale: cutlass.Float32,
         tiled_mma: cute.TiledMma,
@@ -1140,7 +1148,15 @@ class _SelectedQKWgmmaKernel:
 
             batch = task_meta[task_idx, 0]
             proxy_head = task_meta[task_idx, 1]
-            key_block = task_meta[task_idx, 2]
+            key_unit = task_meta[task_idx, 2]
+            key_block = key_unit
+            key_begin = Int32(0)
+            key_end = Int32(self.block)
+            if cutlass.const_expr(self.segmented):
+                segment_start = segment_starts[key_unit]
+                key_block = segment_start // Int32(self.block)
+                key_begin = segment_start - key_block * Int32(self.block)
+                key_end = key_begin + segment_lengths[key_unit]
             query_count = task_meta[task_idx, 3]
             if not active:
                 query_count = Int32(0)
@@ -1316,6 +1332,12 @@ class _SelectedQKWgmmaKernel:
                     acc_mn = cute.make_tensor(
                         acc.iterator, self._layout_acc_mn(tiled_mma, acc.layout)
                     )
+                    if cutlass.const_expr(self.segmented):
+                        for row in cutlass.range_constexpr(cute.size(acc_mn, mode=[0])):
+                            for col in cutlass.range_constexpr(cute.size(acc_mn, mode=[1])):
+                                key_column = coordinates_mn[row, col][1]
+                                if key_column < key_begin or key_column >= key_end:
+                                    acc_mn[row, col] = cutlass.Float32(-float("inf"))
                     row_layout = cute.make_layout(cute.size(acc_mn, mode=[0]))
                     row_scale_log2 = cute.make_rmem_tensor_like(
                         row_layout, cutlass.Float32
@@ -1495,6 +1517,8 @@ def wgmma_selected_qk(
             scores_cute,
             scores_cute,
             scores_cute,
+            qids_cute,
+            qids_cute,
             1.0,
             stream,
         )
@@ -1512,6 +1536,8 @@ def wgmma_selected_qk(
         scores_cute,
         scores_cute,
         scores_cute,
+        qids_cute,
+        qids_cute,
         1.0,
         stream,
     )
@@ -1584,6 +1610,8 @@ def wgmma_selected_softmax(
             scores_cute,
             scores_cute,
             scores_cute,
+            qids_cute,
+            qids_cute,
             float(scale),
             stream,
         )
@@ -1601,6 +1629,8 @@ def wgmma_selected_softmax(
         scores_cute,
         scores_cute,
         scores_cute,
+        qids_cute,
+        qids_cute,
         float(scale),
         stream,
     )
@@ -1619,6 +1649,8 @@ def wgmma_selected_attention(
     q_scale: torch.Tensor | None = None,
     k_scale: torch.Tensor | None = None,
     v_scale: torch.Tensor | None = None,
+    segment_starts: torch.Tensor | None = None,
+    segment_lengths: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return partial output/LSE using BF16 compute and BF16 or E4M3 K/V storage."""
 
@@ -1647,6 +1679,19 @@ def wgmma_selected_attention(
             )
     elif q.dtype != k.dtype or k.dtype not in (torch.float16, torch.bfloat16):
         raise ValueError("BF16/FP16 Q/K/V shapes and dtypes must match")
+    segmented = segment_starts is not None or segment_lengths is not None
+    if segmented:
+        if segment_starts is None or segment_lengths is None:
+            raise ValueError("segment_starts and segment_lengths must be provided together")
+        if (
+            segment_starts.device != q.device
+            or segment_lengths.device != q.device
+            or segment_starts.dtype != torch.int32
+            or segment_lengths.dtype != torch.int32
+            or segment_starts.ndim != 1
+            or segment_lengths.shape != segment_starts.shape
+        ):
+            raise ValueError("segment metadata must be matching CUDA int32 vectors")
     num_tasks = int(task_meta.shape[0])
     # Production specialization does not write either diagnostic tensor. Keep
     # one aligned element because the common compiled signature still carries
@@ -1679,6 +1724,12 @@ def wgmma_selected_attention(
     q_scale_cute = _to_cute_tensor(q_scale) if fp8_kv else scores_cute
     k_scale_cute = _to_cute_tensor(k_scale) if fp8_kv else scores_cute
     v_scale_cute = _to_cute_tensor(v_scale) if fp8_kv else scores_cute
+    segment_starts_cute = (
+        _to_cute_tensor(segment_starts.contiguous()) if segmented else qids_cute
+    )
+    segment_lengths_cute = (
+        _to_cute_tensor(segment_lengths.contiguous()) if segmented else qids_cute
+    )
     sm_count = torch.cuda.get_device_properties(q.device).multi_processor_count
     ctas_per_sm = max(1, int(os.environ.get("MSA_SM90_CTAS_PER_SM", "4")))
     max_ctas = int(os.environ.get("MSA_SM90_MAX_CTAS", "0"))
@@ -1701,6 +1752,7 @@ def wgmma_selected_attention(
         num_ctas,
         q_cute.element_type,
         fp8_kv,
+        segmented,
     )
     if key not in _COMPILE_CACHE:
         kernel = _SelectedQKWgmmaKernel(
@@ -1711,6 +1763,7 @@ def wgmma_selected_attention(
             persistent=persistent,
             num_ctas=num_ctas,
             fp8_kv=fp8_kv,
+            segmented=segmented,
         )
         _COMPILE_CACHE[key] = cute.compile(
             kernel,
@@ -1727,6 +1780,8 @@ def wgmma_selected_attention(
             q_scale_cute,
             k_scale_cute,
             v_scale_cute,
+            segment_starts_cute,
+            segment_lengths_cute,
             float(scale),
             stream,
         )
@@ -1744,6 +1799,8 @@ def wgmma_selected_attention(
         q_scale_cute,
         k_scale_cute,
         v_scale_cute,
+        segment_starts_cute,
+        segment_lengths_cute,
         float(scale),
         stream,
     )

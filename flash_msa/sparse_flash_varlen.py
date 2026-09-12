@@ -219,7 +219,6 @@ def sparse_flash_varlen_forward(
 
     use_sm90_forward = (
         os.environ.get("MSA_FORWARD_BACKEND", "fa3").lower() == "sm90"
-        and metadata.document_segments is None
         and metadata.kv_outer_schedule is not None
     )
     if use_sm90_forward and metadata.num_remote_tasks:
@@ -283,6 +282,16 @@ def sparse_flash_varlen_forward(
             schedule.query_indices[: schedule.num_edges],
             n_proxy_heads=n_proxy_heads,
             scale=float(scale),
+            segment_starts=(
+                None
+                if metadata.document_segments is None
+                else metadata.document_segments.starts
+            ),
+            segment_lengths=(
+                None
+                if metadata.document_segments is None
+                else metadata.document_segments.lengths
+            ),
             **attention_kwargs,
         )
         if output_accum is None:

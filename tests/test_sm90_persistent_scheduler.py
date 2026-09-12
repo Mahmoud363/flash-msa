@@ -126,6 +126,40 @@ def test_selected_attention_uses_pv_wgmma() -> None:
     )
 
 
+def test_segmented_selected_attention_predicates_document_boundaries() -> None:
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (9, 0):
+        pytest.skip("SM90 test")
+    torch.manual_seed(33)
+    q = torch.randn(1, 16, 512, 128, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(1, 2, 512, 128, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    qids = torch.arange(200, 216, dtype=torch.int32, device="cuda")
+    task_meta = torch.tensor([[0, 1, 0, 16, 0]], dtype=torch.int32, device="cuda")
+    starts = torch.tensor([17], dtype=torch.int32, device="cuda")
+    lengths = torch.tensor([43], dtype=torch.int32, device="cuda")
+    scale = 128**-0.5
+    output, lse = wgmma_selected_attention(
+        q,
+        k,
+        v,
+        task_meta,
+        qids,
+        n_proxy_heads=4,
+        scale=scale,
+        segment_starts=starts,
+        segment_lengths=lengths,
+    )
+    gathered_q = q[0, 4:8, qids.long()].permute(1, 0, 2).reshape(64, 128)
+    logits = (gathered_q.float() @ k[0, 0, 17:60].float().T) * scale
+    reference = logits.softmax(dim=-1) @ v[0, 0, 17:60].float()
+    torch.testing.assert_close(
+        output.reshape(64, 128).float(), reference, rtol=1e-2, atol=2e-2
+    )
+    torch.testing.assert_close(
+        lse.reshape(-1), logits.logsumexp(dim=-1), rtol=3e-3, atol=3e-3
+    )
+
+
 @pytest.mark.parametrize(
     ("n_heads", "n_proxy_heads", "n_kv_heads"), [(8, 4, 2), (16, 2, 2)]
 )
