@@ -375,10 +375,18 @@ class _SelectedQKWgmmaKernel:
     rows = 64
     block = 128
 
-    def __init__(self, num_tasks: int, main_per_proxy: int, proxy_per_kv: int) -> None:
+    def __init__(
+        self,
+        num_tasks: int,
+        main_per_proxy: int,
+        proxy_per_kv: int,
+        *,
+        write_debug: bool = False,
+    ) -> None:
         self.num_tasks = int(num_tasks)
         self.main_per_proxy = int(main_per_proxy)
         self.proxy_per_kv = int(proxy_per_kv)
+        self.write_debug = bool(write_debug)
 
     @staticmethod
     @cute.jit
@@ -807,17 +815,19 @@ class _SelectedQKWgmmaKernel:
                 )
                 cute.nvgpu.warpgroup.commit_group()
                 cute.nvgpu.warpgroup.wait_group(0)
-                if query_start == 0:
-                    g_scores = scores[task_idx, None, None]
-                    tCg = thr_mma.partition_C(g_scores)
-                    for i in cutlass.range(cute.size(acc), unroll_full=True):
-                        tCg[i] = acc[i]
+                if cutlass.const_expr(self.write_debug):
+                    if query_start == 0:
+                        g_scores = scores[task_idx, None, None]
+                        tCg = thr_mma.partition_C(g_scores)
+                        for i in cutlass.range(cute.size(acc), unroll_full=True):
+                            tCg[i] = acc[i]
                 row_max, row_sum = self._softmax_fp32(acc, tiled_mma, scale_log2)
-                if query_start == 0:
-                    g_probabilities = probabilities[task_idx, None, None]
-                    tPg = thr_mma.partition_C(g_probabilities)
-                    for i in cutlass.range(cute.size(acc), unroll_full=True):
-                        tPg[i] = acc[i]
+                if cutlass.const_expr(self.write_debug):
+                    if query_start == 0:
+                        g_probabilities = probabilities[task_idx, None, None]
+                        tPg = thr_mma.partition_C(g_probabilities)
+                        for i in cutlass.range(cute.size(acc), unroll_full=True):
+                            tPg[i] = acc[i]
 
                 coordinates = cute.make_identity_tensor((self.rows, self.block))
                 tCoordinates = thr_mma.partition_C(coordinates)
@@ -926,9 +936,18 @@ def wgmma_selected_qk(
     probabilities_cute = _to_cute_tensor(probabilities)
     lse_cute = _to_cute_tensor(lse)
     stream = cuda.CUstream(torch.cuda.current_stream(q.device).cuda_stream)
-    key = ("selected_qk_wgmma", num_tasks, main_per_proxy, proxy_per_kv, q_cute.element_type)
+    key = (
+        "selected_qk_wgmma",
+        num_tasks,
+        main_per_proxy,
+        proxy_per_kv,
+        True,
+        q_cute.element_type,
+    )
     if key not in _COMPILE_CACHE:
-        kernel = _SelectedQKWgmmaKernel(num_tasks, main_per_proxy, proxy_per_kv)
+        kernel = _SelectedQKWgmmaKernel(
+            num_tasks, main_per_proxy, proxy_per_kv, write_debug=True
+        )
         _COMPILE_CACHE[key] = cute.compile(
             kernel,
             q_cute,
@@ -996,9 +1015,18 @@ def wgmma_selected_softmax(
     probabilities_cute = _to_cute_tensor(probabilities)
     lse_cute = _to_cute_tensor(lse)
     stream = cuda.CUstream(torch.cuda.current_stream(q.device).cuda_stream)
-    key = ("selected_qk_wgmma", num_tasks, main_per_proxy, proxy_per_kv, q_cute.element_type)
+    key = (
+        "selected_qk_wgmma",
+        num_tasks,
+        main_per_proxy,
+        proxy_per_kv,
+        True,
+        q_cute.element_type,
+    )
     if key not in _COMPILE_CACHE:
-        kernel = _SelectedQKWgmmaKernel(num_tasks, main_per_proxy, proxy_per_kv)
+        kernel = _SelectedQKWgmmaKernel(
+            num_tasks, main_per_proxy, proxy_per_kv, write_debug=True
+        )
         _COMPILE_CACHE[key] = cute.compile(
             kernel,
             q_cute,
@@ -1044,7 +1072,10 @@ def wgmma_selected_attention(
     if k.shape != v.shape or q.dtype != k.dtype or k.dtype != v.dtype:
         raise ValueError("K/V shapes and Q/K/V dtypes must match")
     num_tasks = int(task_meta.shape[0])
-    scores = torch.empty((num_tasks, 64, 128), device=q.device, dtype=torch.float32)
+    # Production specialization does not write either diagnostic tensor. Keep
+    # one aligned element because the common compiled signature still carries
+    # the arguments used by the focused QK/softmax validation specializations.
+    scores = torch.empty(1, device=q.device, dtype=torch.float32)
     probabilities = torch.empty_like(scores)
     main_per_proxy, queries_per_tile, proxy_per_kv = _forward_head_tiling(
         int(q.shape[1]), int(k.shape[1]), int(n_proxy_heads)
@@ -1068,9 +1099,18 @@ def wgmma_selected_attention(
     lse_cute = _to_cute_tensor(lse)
     output_cute = _to_cute_tensor(output)
     stream = cuda.CUstream(torch.cuda.current_stream(q.device).cuda_stream)
-    key = ("selected_qk_wgmma", num_tasks, main_per_proxy, proxy_per_kv, q_cute.element_type)
+    key = (
+        "selected_qk_wgmma",
+        num_tasks,
+        main_per_proxy,
+        proxy_per_kv,
+        False,
+        q_cute.element_type,
+    )
     if key not in _COMPILE_CACHE:
-        kernel = _SelectedQKWgmmaKernel(num_tasks, main_per_proxy, proxy_per_kv)
+        kernel = _SelectedQKWgmmaKernel(
+            num_tasks, main_per_proxy, proxy_per_kv, write_debug=False
+        )
         _COMPILE_CACHE[key] = cute.compile(
             kernel,
             q_cute,
