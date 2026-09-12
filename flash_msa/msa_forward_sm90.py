@@ -18,7 +18,7 @@ from cutlass._mlir.dialects import math as _math
 from cutlass.cute.runtime import from_dlpack
 from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass import pipeline
-from cutlass.cute.nvgpu import warpgroup
+from cutlass.cute.nvgpu import cpasync, warpgroup
 import cutlass.utils as utils
 import cutlass.utils.hopper_helpers as sm90_utils
 
@@ -34,6 +34,11 @@ if Q_PIPELINE_STAGES not in (1, 2):
 
 def _to_cute_tensor(tensor: torch.Tensor) -> cute.Tensor:
     return from_dlpack(tensor.detach(), assumed_align=16)
+
+
+@dsl_user_op
+def _elem_pointer(tensor: cute.Tensor, coord: cute.Coord, *, loc=None, ip=None):
+    return tensor.iterator + cute.crd2idx(coord, tensor.layout, loc=loc, ip=ip)
 
 
 def _forward_head_tiling(
@@ -889,6 +894,21 @@ class _SelectedQKWgmmaKernel:
             dtype,
             Q_PIPELINE_STAGES,
         )
+        q_copy_atom = cute.make_copy_atom(
+            cpasync.CopyG2SOp(cache_mode=cpasync.LoadCacheMode.GLOBAL),
+            dtype,
+            num_bits_per_copy=128,
+        )
+        q_copy_elements = 128 // dtype.width
+        q_threads_per_row = self.block // q_copy_elements
+        q_gmem_copy = cute.make_tiled_copy_tv(
+            q_copy_atom,
+            cute.make_ordered_layout(
+                (128 // q_threads_per_row, q_threads_per_row), order=(1, 0)
+            ),
+            cute.make_layout((1, q_copy_elements)),
+        )
+        self._q_copy_elements = q_copy_elements
         k_smem_staged = sm90_utils.make_smem_layout_b(
             k_layout_enum, (self.rows, self.block, head_dim), dtype, 1
         )
@@ -996,6 +1016,7 @@ class _SelectedQKWgmmaKernel:
             v_smem_staged,
             k_tma_smem_staged,
             v_tma_smem_staged,
+            q_gmem_copy,
         ).launch(
             grid=[self.num_ctas, 1, 1],
             block=[256, 1, 1],
@@ -1030,6 +1051,7 @@ class _SelectedQKWgmmaKernel:
         v_smem_staged: cute.ComposedLayout,
         k_tma_smem_staged: cute.ComposedLayout,
         v_tma_smem_staged: cute.ComposedLayout,
+        q_gmem_copy: cute.TiledCopy,
     ):
         tidx, _, _ = cute.arch.thread_idx()
         block_idx, _, _ = cute.arch.block_idx()
@@ -1212,10 +1234,12 @@ class _SelectedQKWgmmaKernel:
                     q_stage = cute.slice_(
                         sQ, (None, None, q_producer_state.index)
                     )
-                    linear = tidx
-                    while linear < Int32(self.rows * self.block):
-                        row = linear // Int32(self.block)
-                        col = linear - row * Int32(self.block)
+                    q_copy = q_gmem_copy.get_slice(tidx)
+                    tQsQ = q_copy.partition_D(q_stage)
+                    q_coords = cute.make_identity_tensor((self.rows, self.block))
+                    tQcQ = q_copy.partition_S(q_coords)
+                    for copy_row in cutlass.range_constexpr(tQsQ.shape[1]):
+                        row = tQcQ[0, copy_row, 0][0]
                         tile_slot = row // Int32(self.main_per_proxy)
                         query_slot = query_start + tile_slot
                         main_offset = row - tile_slot * Int32(self.main_per_proxy)
@@ -1224,10 +1248,34 @@ class _SelectedQKWgmmaKernel:
                         if valid:
                             qid = query_indices[edge_offset + query_slot]
                         head = proxy_head * Int32(self.main_per_proxy) + main_offset
-                        q_stage[row, col] = (
-                            q[qid, col, head, batch] if valid else self._dtype(0)
-                        )
-                        linear += Int32(128)
+                        if valid:
+                            source = cute.make_tensor(
+                                cute.make_ptr(
+                                    self._dtype,
+                                    _elem_pointer(q, (qid, 0, head, batch)).llvm_ptr,
+                                    cute.AddressSpace.gmem,
+                                    assumed_align=16,
+                                ),
+                                cute.make_layout(self.block),
+                            )
+                            source_vectors = cute.tiled_divide(
+                                source, (self._q_copy_elements,)
+                            )
+                            for copy_col in cutlass.range_constexpr(tQsQ.shape[2]):
+                                vector = (
+                                    tQcQ[0, 0, copy_col][1]
+                                    // self._q_copy_elements
+                                )
+                                cute.copy(
+                                    q_copy,
+                                    source_vectors[None, vector],
+                                    tQsQ[None, copy_row, copy_col],
+                                )
+                        else:
+                            for copy_col in cutlass.range_constexpr(tQsQ.shape[2]):
+                                tQsQ[None, copy_row, copy_col].fill(self._dtype(0))
+                    cute.arch.cp_async_commit_group()
+                    cute.arch.cp_async_wait_group(0)
                     q_pipe.producer_commit(q_producer_state)
                     q_producer_state.advance()
                     query_start += queries_per_tile
