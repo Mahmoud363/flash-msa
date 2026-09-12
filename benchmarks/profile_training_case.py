@@ -33,6 +33,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--repeats", type=int, default=5)
     parser.add_argument("--seed", type=int, default=67)
+    parser.add_argument(
+        "--exclude-kl",
+        action="store_true",
+        help="Exclude the proxy KL scalar from the timed backward loss.",
+    )
     parser.add_argument("--json", type=Path)
     return parser.parse_args()
 
@@ -133,7 +138,10 @@ def forward(
             args.head_dim**-0.5,
             cu_seqlens=cu_seqlens,
         )
-    return output, output.float().sum() + kl_loss.float()
+    loss = output.float().sum()
+    if not args.exclude_kl:
+        loss = loss + kl_loss.float()
+    return output, loss
 
 
 def timed(operation) -> float:
@@ -206,6 +214,7 @@ def main() -> None:
             "warmup": args.warmup,
             "repeats": args.repeats,
             "seed": args.seed,
+            "exclude_kl": args.exclude_kl,
         },
         "timing_ms": {
             "forward_median": statistics.median(forward_ms),
