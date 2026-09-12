@@ -405,20 +405,30 @@ class _KVRowBackwardKernel:
     keys = 64
     dim = 128
 
-    def __init__(self, batch, n_heads, n_kv_heads, n_proxy_heads, seq_len):
+    def __init__(
+        self, batch, n_heads, n_kv_heads, n_proxy_heads, seq_len,
+        num_key_units, segmented=False,
+    ):
         self.batch = int(batch)
         self.n_heads = int(n_heads)
         self.n_kv_heads = int(n_kv_heads)
         self.n_proxy_heads = int(n_proxy_heads)
         self.seq_len = int(seq_len)
         self.num_blocks = self.seq_len // 128
+        self.num_key_units = int(num_key_units)
+        self.segmented = bool(segmented)
         self.main_per_proxy = self.n_heads // self.n_proxy_heads
         self.proxy_per_kv = self.n_proxy_heads // self.n_kv_heads
         self.queries_per_group = self.rows // self.main_per_proxy
-        self.num_rows = self.batch * self.n_proxy_heads * self.num_blocks
+        self.num_rows = (
+            self.n_proxy_heads * self.num_key_units
+            if self.segmented
+            else self.batch * self.n_proxy_heads * self.num_blocks
+        )
 
     @cute.jit
     def __call__(self, q, k, v, grad_o, lse, delta, row_ptr, query_ids,
+                 segment_starts, segment_lengths, segment_batches,
                  dq, dk, dv, scale: Float32, stream: cuda.CUstream):
         dtype = q.element_type
         layouts = [
@@ -449,14 +459,18 @@ class _KVRowBackwardKernel:
             sdS: cute.struct.Align[cute.struct.MemRange[dtype, cute.cosize(sPdS_layout)], 1024]
 
         self._kvrow_storage = SharedStorage
-        self.kernel(q, k, v, grad_o, lse, delta, row_ptr, query_ids, dq, dk, dv,
-                    scale, mma_sdp, mma_dkv, mma_dq, *layouts).launch(
+        self.kernel(
+            q, k, v, grad_o, lse, delta, row_ptr, query_ids,
+            segment_starts, segment_lengths, segment_batches, dq, dk, dv,
+            scale, mma_sdp, mma_dkv, mma_dq, *layouts,
+        ).launch(
             grid=[self.num_rows * 2, 1, 1], block=[128, 1, 1],
             smem=SharedStorage.size_in_bytes(), stream=stream
         )
 
     @cute.kernel
-    def kernel(self, q, k, v, grad_o, lse, delta, row_ptr, query_ids, dq, dk, dv,
+    def kernel(self, q, k, v, grad_o, lse, delta, row_ptr, query_ids,
+               segment_starts, segment_lengths, segment_batches, dq, dk, dv,
                scale: Float32, mma_sdp: cute.TiledMma, mma_dkv: cute.TiledMma,
                mma_dq: cute.TiledMma, sQ_layout, sK_layout, sV_layout,
                sdO_layout, sPdS_layout):
@@ -468,9 +482,24 @@ class _KVRowBackwardKernel:
         edge_end = row_ptr[row_idx + Int32(1)]
 
         row_tmp = row_idx // Int32(self.num_blocks)
-        key_block = row_idx - row_tmp * Int32(self.num_blocks)
+        key_unit = row_idx - row_tmp * Int32(self.num_blocks)
         batch_idx = row_tmp // Int32(self.n_proxy_heads)
         proxy_head = row_tmp - batch_idx * Int32(self.n_proxy_heads)
+        key_block = key_unit
+        key_begin = Int32(0)
+        key_end = Int32(128)
+        local_query_start = key_block * Int32(128)
+        local_query_count = Int32(128)
+        if cutlass.const_expr(self.segmented):
+            proxy_head = row_idx // Int32(self.num_key_units)
+            key_unit = row_idx - proxy_head * Int32(self.num_key_units)
+            batch_idx = segment_batches[key_unit]
+            segment_start = segment_starts[key_unit]
+            local_query_start = segment_start
+            local_query_count = segment_lengths[key_unit]
+            key_block = segment_start // Int32(128)
+            key_begin = segment_start - key_block * Int32(128)
+            key_end = key_begin + local_query_count
         kv_head = proxy_head // Int32(self.proxy_per_kv)
         key_start = key_block * Int32(128) + key_slice * Int32(64)
 
@@ -500,7 +529,7 @@ class _KVRowBackwardKernel:
         # Forward always includes the query's own 128-token block, while the
         # compact reverse CSR stores only remote selections.  Visit the local
         # queries first, then the explicit CSR entries.
-        row_count = Int32(128) + edge_end - edge_begin
+        row_count = local_query_count + edge_end - edge_begin
         row_work_base = Int32(0)
         while row_work_base < row_count:
             linear = tidx
@@ -513,10 +542,10 @@ class _KVRowBackwardKernel:
                 valid = local_work < row_count
                 qid = Int32(0)
                 if valid:
-                    if local_work < Int32(128):
-                        qid = key_block * Int32(128) + local_work
+                    if local_work < local_query_count:
+                        qid = local_query_start + local_work
                     else:
-                        qid = query_ids[edge_begin + local_work - Int32(128)]
+                        qid = query_ids[edge_begin + local_work - local_query_count]
                 main_head = proxy_head * Int32(self.main_per_proxy) + head_off
                 value_q = q.element_type(0.0)
                 value_do = q.element_type(0.0)
@@ -551,12 +580,17 @@ class _KVRowBackwardKernel:
                     valid = local_work < row_count
                     qid = Int32(0)
                     if valid:
-                        if local_work < Int32(128):
-                            qid = key_block * Int32(128) + local_work
+                        if local_work < local_query_count:
+                            qid = local_query_start + local_work
                         else:
-                            qid = query_ids[edge_begin + local_work - Int32(128)]
+                            qid = query_ids[edge_begin + local_work - local_query_count]
                     main_head = proxy_head * Int32(self.main_per_proxy) + head_off
-                    valid = valid and key_start + kc <= qid
+                    valid = (
+                        valid
+                        and key_slice * Int32(64) + kc >= key_begin
+                        and key_slice * Int32(64) + kc < key_end
+                        and key_start + kc <= qid
+                    )
                     probability = Float32(0.0)
                     ds_value = Float32(0.0)
                     if valid:
@@ -607,10 +641,10 @@ class _KVRowBackwardKernel:
                     local_work = row_work_base + slot
                     if local_work < row_count:
                         qid = Int32(0)
-                        if local_work < Int32(128):
-                            qid = key_block * Int32(128) + local_work
+                        if local_work < local_query_count:
+                            qid = local_query_start + local_work
                         else:
-                            qid = query_ids[edge_begin + local_work - Int32(128)]
+                            qid = query_ids[edge_begin + local_work - local_query_count]
                         main_head = proxy_head * Int32(self.main_per_proxy) + head_off
                         _atomic_add_fp32(
                             dq_values_mn[ri, ci],
@@ -720,8 +754,11 @@ def wgmma_kv_row_backward_main(
     *,
     n_proxy_heads: int,
     scale: float,
+    segment_starts: torch.Tensor | None = None,
+    segment_lengths: torch.Tensor | None = None,
+    segment_batches: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Run the fixed-length KV-stationary reverse-CSR main backward."""
+    """Run the fixed or segment-aware KV-stationary reverse-CSR backward."""
 
     if q.device.type != "cuda" or torch.cuda.get_device_capability(q.device) != (9, 0):
         raise RuntimeError("KV-row backward requires a compute capability 9.0 GPU")
@@ -749,7 +786,36 @@ def wgmma_kv_row_backward_main(
     main_per_proxy = n_heads // n_proxy_heads
     if 64 % main_per_proxy:
         raise NotImplementedError("main heads per proxy must divide 64")
-    expected_rows = batch * n_proxy_heads * (seq_len // 128)
+    segmented = any(
+        item is not None
+        for item in (segment_starts, segment_lengths, segment_batches)
+    )
+    if segmented and not all(
+        item is not None
+        for item in (segment_starts, segment_lengths, segment_batches)
+    ):
+        raise ValueError("all three segment metadata tensors must be provided together")
+    if segmented:
+        assert segment_starts is not None
+        assert segment_lengths is not None
+        assert segment_batches is not None
+        if any(
+            item.device != q.device or item.dtype != torch.int32 or item.ndim != 1
+            for item in (segment_starts, segment_lengths, segment_batches)
+        ) or not (
+            segment_starts.shape == segment_lengths.shape == segment_batches.shape
+        ):
+            raise ValueError("segment metadata must be matching CUDA int32 vectors")
+        num_key_units = int(segment_starts.numel())
+        if num_key_units < 1:
+            raise ValueError("segment metadata must contain at least one segment")
+    else:
+        num_key_units = seq_len // 128
+    expected_rows = (
+        n_proxy_heads * num_key_units
+        if segmented
+        else batch * n_proxy_heads * num_key_units
+    )
     if row_ptr.numel() != expected_rows + 1:
         raise ValueError(f"row_ptr must have {expected_rows + 1} entries")
 
@@ -758,20 +824,36 @@ def wgmma_kv_row_backward_main(
     delta_c = delta.detach().to(torch.float32).contiguous()
     row_ptr_c = row_ptr.detach().contiguous()
     query_ids_c = query_ids.detach().contiguous()
+    segment_starts_c = (
+        segment_starts.detach().contiguous() if segmented else query_ids_c
+    )
+    segment_lengths_c = (
+        segment_lengths.detach().contiguous() if segmented else query_ids_c
+    )
+    segment_batches_c = (
+        segment_batches.detach().contiguous() if segmented else query_ids_c
+    )
     dq = torch.zeros_like(q, dtype=torch.float32)
     dk = torch.zeros_like(k, dtype=torch.float32)
     dv = torch.zeros_like(v, dtype=torch.float32)
     args = tuple(
         _to_cute_tensor(t)
-        for t in (*packed, lse_c, delta_c, row_ptr_c, query_ids_c, dq, dk, dv)
+        for t in (
+            *packed, lse_c, delta_c, row_ptr_c, query_ids_c,
+            segment_starts_c, segment_lengths_c, segment_batches_c,
+            dq, dk, dv,
+        )
     )
     stream = cuda.CUstream(torch.cuda.current_stream(q.device).cuda_stream)
     key = (
         "kv_row_backward_main", args[0].element_type, batch, n_heads,
-        n_kv_heads, n_proxy_heads, seq_len,
+        n_kv_heads, n_proxy_heads, seq_len, num_key_units, segmented,
     )
     if key not in _COMPILE_CACHE:
-        kernel = _KVRowBackwardKernel(batch, n_heads, n_kv_heads, n_proxy_heads, seq_len)
+        kernel = _KVRowBackwardKernel(
+            batch, n_heads, n_kv_heads, n_proxy_heads, seq_len,
+            num_key_units, segmented,
+        )
         _COMPILE_CACHE[key] = cute.compile(kernel, *args, float(scale), stream)
     _COMPILE_CACHE[key](*args, float(scale), stream)
     return dq, dk, dv

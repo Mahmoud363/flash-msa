@@ -181,6 +181,21 @@ port must make destination IDs segment-aware, predicate partial first/last
 document tiles, and preserve batch-row boundaries while reusing the same
 destination-gather and layout-partitioned-copy structure.
 
+The forward varlen port was subsequently completed in commit `1568fb0`. The
+native reverse-CSR backward now also accepts document segments: CSR rows use
+canonical `(proxy_head, key_segment)` order, batch IDs come from segment
+metadata, implicit local queries span only the current segment, and both halves
+of a physical 128-token tile are predicated to the segment boundaries. The
+segmented metadata builder keeps task offsets and CSR rows in the same canonical
+order, including across batch-row boundaries.
+
+At B=1, S=16K, Top-K=2K with 32 uneven documents, the initial correctness-first
+native backward is 4.090 ms versus 3.305 ms for the legacy main-only kernel.
+Gradient cosines are 0.999993 (`dQ`), 0.999990 (`dK`), and 0.999913 (`dV`). It
+is therefore not production-dispatched yet; the remaining Milestone 6 work is
+to recover the fixed/segmented performance gap with the shared Hopper pipeline
+before replacing the legacy backward.
+
 ## Milestone 4: FP8 KV storage with BF16 compute
 
 Store K/V as E4M3, load through TMA, and convert into BF16 shared-memory layouts

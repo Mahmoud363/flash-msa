@@ -364,28 +364,26 @@ __global__ void scan_remote_segment_meta_kernel(
     int edge = 0;
     int task = 0;
     int buckets = Hp * NS;
-    for (int full_pass = 1; full_pass >= 0; --full_pass) {
-        for (int bucket = 0; bucket < buckets; ++bucket) {
-            int key_segment = bucket % NS;
-            if (full_segments[key_segment] != full_pass) {
-                continue;
-            }
-            bucket_offsets[bucket] = edge;
-            int count = counts[bucket];
-            int proxy_head = bucket / NS;
-            for (int start = 0; start < count && task < padded_tasks; start += query_chunk) {
-                int valid = min(query_chunk, count - start);
-                int64_t row = (int64_t)task * 5;
-                task_meta[row + 0] = segment_batches[key_segment];
-                task_meta[row + 1] = proxy_head;
-                task_meta[row + 2] = key_segment;
-                task_meta[row + 3] = valid;
-                task_meta[row + 4] = edge + start;
-                task_offsets[task] = edge + start;
-                ++task;
-            }
-            edge += count;
+    // Keep remote edges and tasks in canonical bucket order.  Besides making
+    // task_offsets valid varlen cu_seqlens, this makes bucket_offsets a true
+    // CSR row pointer that the segment-aware KV-outer backward can consume.
+    for (int bucket = 0; bucket < buckets; ++bucket) {
+        int key_segment = bucket % NS;
+        bucket_offsets[bucket] = edge;
+        int count = counts[bucket];
+        int proxy_head = bucket / NS;
+        for (int start = 0; start < count && task < padded_tasks; start += query_chunk) {
+            int valid = min(query_chunk, count - start);
+            int64_t row = (int64_t)task * 5;
+            task_meta[row + 0] = segment_batches[key_segment];
+            task_meta[row + 1] = proxy_head;
+            task_meta[row + 2] = key_segment;
+            task_meta[row + 3] = valid;
+            task_meta[row + 4] = edge + start;
+            task_offsets[task] = edge + start;
+            ++task;
         }
+        edge += count;
     }
     bucket_offsets[buckets] = edge;
     task_offsets[task] = edge;

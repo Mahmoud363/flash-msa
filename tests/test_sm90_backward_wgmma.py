@@ -8,6 +8,10 @@ from flash_msa.msa_backward_sm90 import (
     wgmma_backward_dq,
     wgmma_kv_row_backward_main,
 )
+from flash_msa.reverse_index_cuda import (
+    build_document_segment_metadata,
+    build_sparse_attention_metadata_cuda,
+)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
@@ -86,3 +90,80 @@ def test_kv_row_backward_matches_dense_causal_attention() -> None:
     )
     for result, reference in zip(actual, references):
         torch.testing.assert_close(result, reference, rtol=8e-3, atol=8e-3)
+
+
+def test_segmented_kv_row_backward_predicates_uneven_documents() -> None:
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (9, 0):
+        pytest.skip("SM90 test")
+    torch.manual_seed(239)
+    batch, heads, proxy_heads, seq_len, dim = 2, 4, 1, 128, 128
+    scale = dim**-0.5
+    documents = torch.empty(batch, seq_len, device="cuda", dtype=torch.int32)
+    documents[0, :37], documents[0, 37:91], documents[0, 91:] = 0, 1, 2
+    documents[1, :19], documents[1, 19:73], documents[1, 73:] = 3, 4, 5
+    segments = build_document_segment_metadata(documents)
+    q = torch.randn(batch, heads, seq_len, dim, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(batch, 1, seq_len, dim, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    grad_out = torch.randn_like(q)
+    q_ref = q.float().detach().requires_grad_(True)
+    k_ref = k.float().detach().requires_grad_(True)
+    v_ref = v.float().detach().requires_grad_(True)
+    scores = torch.einsum(
+        "bhsd,bhtd->bhst", q_ref, k_ref.expand(-1, heads, -1, -1)
+    ) * scale
+    causal = torch.ones(seq_len, seq_len, device="cuda", dtype=torch.bool).triu(1)
+    different_document = documents[:, None, :, None] != documents[:, None, None, :]
+    scores = scores.masked_fill(causal[None, None] | different_document, -torch.inf)
+    probability = scores.softmax(dim=-1)
+    output = torch.einsum(
+        "bhst,bhtd->bhsd", probability, v_ref.expand(-1, heads, -1, -1)
+    )
+    lse = scores.logsumexp(dim=-1).detach()
+    output.backward(grad_out.float())
+    delta = (output.detach() * grad_out.float()).sum(dim=-1)
+    row_ptr = torch.zeros(
+        proxy_heads * segments.num_segments + 1, device="cuda", dtype=torch.int32
+    )
+    actual = wgmma_kv_row_backward_main(
+        q, k, v, grad_out, lse, delta, row_ptr,
+        torch.empty(1, device="cuda", dtype=torch.int32),
+        n_proxy_heads=proxy_heads,
+        scale=scale,
+        segment_starts=segments.starts,
+        segment_lengths=segments.lengths,
+        segment_batches=segments.batches,
+    )
+    for result, reference in zip(actual, (q_ref.grad, k_ref.grad, v_ref.grad)):
+        torch.testing.assert_close(result, reference, rtol=2e-2, atol=2e-2)
+
+
+def test_segmented_remote_metadata_is_canonical_reverse_csr() -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA test")
+    documents = torch.empty(1, 128, device="cuda", dtype=torch.int32)
+    documents[0, :37], documents[0, 37:91], documents[0, 91:] = 0, 1, 2
+    segments = build_document_segment_metadata(documents)
+    selected = torch.zeros((1, 1, 128, 1), device="cuda", dtype=torch.int32)
+    metadata = build_sparse_attention_metadata_cuda(
+        selected,
+        backward_query_chunk=16,
+        remote_query_chunk=64,
+        document_segments=segments,
+    )
+    schedule = metadata.kv_outer_schedule
+    assert schedule is not None and schedule.segmented
+    torch.testing.assert_close(
+        schedule.row_ptr,
+        torch.tensor([0, 91, 91, 91], device="cuda", dtype=torch.int32),
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(
+        schedule.query_indices[: schedule.num_edges].sort().values,
+        torch.arange(37, 128, device="cuda", dtype=torch.int32),
+        rtol=0,
+        atol=0,
+    )
+    offsets = schedule.task_offsets[: schedule.num_tasks + 1]
+    assert bool((offsets[1:] >= offsets[:-1]).all())
