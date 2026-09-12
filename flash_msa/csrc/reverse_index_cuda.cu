@@ -448,64 +448,72 @@ __global__ void merge_attention_chunk_kernel(
     int head_dim,
     int top_k_blocks)
 {
-    int local_edge = (int)blockIdx.x;
-    if (local_edge >= edge_count) {
-        return;
-    }
-    int global_edge = edge_start + local_edge;
-    int destination = destinations[global_edge];
-    if ((unsigned)destination >= (unsigned)num_destinations) {
-        return;
-    }
-
-    // Only the lowest packed edge for this destination in the current chunk
-    // performs the merge.  It consumes every other slot for the same query,
-    // eliminating inter-CTA atomics and spin locks.
-    for (int slot = 0; slot < top_k_blocks; ++slot) {
-        int pos = edge_positions[(int64_t)destination * top_k_blocks + slot];
-        if (pos >= edge_start && pos < edge_start + edge_count && pos < global_edge) {
-            return;
-        }
-    }
-
+    int destination = (int)blockIdx.x;
     __shared__ float old_weight[32];
-    __shared__ float edge_weight[32];
     __shared__ float merged_lse[32];
-    for (int slot = 0; slot < top_k_blocks; ++slot) {
-        int pos = edge_positions[(int64_t)destination * top_k_blocks + slot];
-        if (pos < edge_start || pos >= edge_start + edge_count) {
-            continue;
-        }
-        int remote_edge = pos - edge_start;
-        if (threadIdx.x < heads_per_proxy) {
-            int h = (int)threadIdx.x;
-            float old_lse = lse_accum[(int64_t)destination * heads_per_proxy + h];
-            float new_lse = remote_lse[(int64_t)remote_edge * heads_per_proxy + h];
-            float max_lse = fmaxf(old_lse, new_lse);
-            float old_exp = expf(old_lse - max_lse);
-            float new_exp = expf(new_lse - max_lse);
-            float denom = old_exp + new_exp;
-            old_weight[h] = old_exp / denom;
-            edge_weight[h] = new_exp / denom;
-            merged_lse[h] = logf(denom) + max_lse;
-        }
-        __syncthreads();
+    __shared__ float edge_weight[32 * 32];
+    __shared__ int remote_edges[32];
 
-        int values = heads_per_proxy * head_dim;
-        for (int linear = (int)threadIdx.x; linear < values; linear += (int)blockDim.x) {
-            int h = linear / head_dim;
-            int64_t out_idx = (int64_t)destination * values + linear;
-            int64_t remote_idx = (int64_t)remote_edge * values + linear;
-            output_accum[out_idx] =
-                output_accum[out_idx] * old_weight[h]
-                + static_cast<float>(remote_output[remote_idx]) * edge_weight[h];
+    if (threadIdx.x < top_k_blocks) {
+        int slot = (int)threadIdx.x;
+        int pos = edge_positions[(int64_t)destination * top_k_blocks + slot];
+        remote_edges[slot] =
+            (pos >= edge_start && pos < edge_start + edge_count)
+            ? pos - edge_start : -1;
+    }
+    __syncthreads();
+
+    if (threadIdx.x < heads_per_proxy) {
+        int h = (int)threadIdx.x;
+        float old_lse = lse_accum[(int64_t)destination * heads_per_proxy + h];
+        float max_lse = old_lse;
+        for (int slot = 0; slot < top_k_blocks; ++slot) {
+            int remote_edge = remote_edges[slot];
+            if (remote_edge >= 0) {
+                max_lse = fmaxf(
+                    max_lse,
+                    remote_lse[(int64_t)remote_edge * heads_per_proxy + h]);
+            }
         }
-        __syncthreads();
-        if (threadIdx.x < heads_per_proxy) {
-            int h = (int)threadIdx.x;
-            lse_accum[(int64_t)destination * heads_per_proxy + h] = merged_lse[h];
+        float denom = expf(old_lse - max_lse);
+        for (int slot = 0; slot < top_k_blocks; ++slot) {
+            int remote_edge = remote_edges[slot];
+            float weight = 0.0f;
+            if (remote_edge >= 0) {
+                weight = expf(
+                    remote_lse[(int64_t)remote_edge * heads_per_proxy + h]
+                    - max_lse);
+                denom += weight;
+            }
+            edge_weight[slot * heads_per_proxy + h] = weight;
         }
-        __syncthreads();
+        float inv_denom = 1.0f / denom;
+        old_weight[h] = expf(old_lse - max_lse) * inv_denom;
+        for (int slot = 0; slot < top_k_blocks; ++slot) {
+            edge_weight[slot * heads_per_proxy + h] *= inv_denom;
+        }
+        merged_lse[h] = logf(denom) + max_lse;
+    }
+    __syncthreads();
+
+    int values = heads_per_proxy * head_dim;
+    for (int linear = (int)threadIdx.x; linear < values; linear += (int)blockDim.x) {
+        int h = linear / head_dim;
+        int64_t out_idx = (int64_t)destination * values + linear;
+        float value = output_accum[out_idx] * old_weight[h];
+        for (int slot = 0; slot < top_k_blocks; ++slot) {
+            int remote_edge = remote_edges[slot];
+            if (remote_edge >= 0) {
+                int64_t remote_idx = (int64_t)remote_edge * values + linear;
+                value += static_cast<float>(remote_output[remote_idx])
+                    * edge_weight[slot * heads_per_proxy + h];
+            }
+        }
+        output_accum[out_idx] = value;
+    }
+    if (threadIdx.x < heads_per_proxy) {
+        int h = (int)threadIdx.x;
+        lse_accum[(int64_t)destination * heads_per_proxy + h] = merged_lse[h];
     }
 }
 
@@ -910,14 +918,14 @@ void merge_attention_chunk_cuda(
     }
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
     if (remote_output.scalar_type() == at::kHalf) {
-        merge_attention_chunk_kernel<at::Half><<<edge_count, 256, 0, stream>>>(
+        merge_attention_chunk_kernel<at::Half><<<num_destinations, 256, 0, stream>>>(
             output_accum.data_ptr<float>(), lse_accum.data_ptr<float>(),
             remote_output.data_ptr<at::Half>(), remote_lse.data_ptr<float>(),
             destinations.data_ptr<int>(), edge_positions.data_ptr<int>(),
             (int)edge_start, edge_count, num_destinations, heads_per_proxy,
             head_dim, (int)top_k_blocks);
     } else {
-        merge_attention_chunk_kernel<at::BFloat16><<<edge_count, 256, 0, stream>>>(
+        merge_attention_chunk_kernel<at::BFloat16><<<num_destinations, 256, 0, stream>>>(
             output_accum.data_ptr<float>(), lse_accum.data_ptr<float>(),
             remote_output.data_ptr<at::BFloat16>(), remote_lse.data_ptr<float>(),
             destinations.data_ptr<int>(), edge_positions.data_ptr<int>(),
