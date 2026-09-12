@@ -203,9 +203,22 @@ def test_autograd_dispatches_sm90_main_backward(monkeypatch) -> None:
             assert float(cosine) >= 0.999
 
 
-@pytest.mark.parametrize("document_masking", [False, True])
+@pytest.mark.parametrize(
+    "document_masking,heads,kv_heads,proxy_heads,proxy_kv_heads",
+    [
+        (False, 16, 2, 4, 1),
+        (True, 16, 2, 4, 1),
+        (False, 8, 2, 4, 1),
+        (False, 32, 4, 8, 2),
+    ],
+)
 def test_autograd_sm90_composes_main_and_proxy_backward(
-    monkeypatch, document_masking: bool
+    monkeypatch,
+    document_masking: bool,
+    heads: int,
+    kv_heads: int,
+    proxy_heads: int,
+    proxy_kv_heads: int,
 ) -> None:
     """The optimized main kernel composes with KL-only proxy gradients."""
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (9, 0):
@@ -213,14 +226,19 @@ def test_autograd_sm90_composes_main_and_proxy_backward(
     monkeypatch.setenv("MSA_FORWARD_BACKEND", "sm90")
     monkeypatch.setenv("MSA_SELECT_BACKEND", "bf16")
     monkeypatch.setenv("MSA_KV_STORAGE", "bf16")
-    torch.manual_seed(257 + int(document_masking))
-    shapes = ((1, 4, 512, 128), (1, 1, 512, 128),
-              (1, 16, 512, 128), (1, 2, 512, 128), (1, 2, 512, 128))
+    torch.manual_seed(257 + int(document_masking) + heads)
+    shapes = (
+        (1, proxy_heads, 512, 128),
+        (1, proxy_kv_heads, 512, 128),
+        (1, heads, 512, 128),
+        (1, kv_heads, 512, 128),
+        (1, kv_heads, 512, 128),
+    )
     inputs = [
         torch.randn(shape, device="cuda", dtype=torch.bfloat16).requires_grad_(True)
         for shape in shapes
     ]
-    grad_output = torch.randn(1, 512, 16 * 128, device="cuda")
+    grad_output = torch.randn(1, 512, heads * 128, device="cuda")
     documents = None
     if document_masking:
         documents = torch.empty(1, 512, device="cuda", dtype=torch.int32)

@@ -221,12 +221,20 @@ and output allocations while retaining the proxy-Q/K KL calculation and its
 upstream-scalar handling. Focused fixed and uneven-document tests compare all
 five gradients against the legacy fused kernel.
 
-On GH200 at B=1, S=16K, Top-K=2K, seven-repeat production-autograd medians are
-22.726 ms for the original fused KL backward and 19.045 ms for the composed
-SM90 path (16.2% faster). With 32 reproducible uneven documents, the medians are
-8.490 ms and 7.107 ms (16.3% faster). This is smaller than the main-only gain
-because proxy Q/K gradients still use a second edge-oriented launch; folding
-them into the resident KV work item remains the final Milestone 6 optimization.
+The proxy-only specialization uses a 128-row task tile while the original fused
+fallback retains its proven 64-row geometry. The query chunk is derived as
+`128 / (main_heads / proxy_heads)`, rather than hard-coding a head count. This
+halves task splitting and amortizes K/proxy-K loads while preserving the same
+segment-aware task metadata. Focused coverage includes 16/2/4/1, 8/2/4/1, and
+32/4/8/2 main-KV/proxy/proxy-KV head layouts.
+
+On GH200 at B=1, S=16K, Top-K=2K, the original fused KL backward measured
+22.726 ms, the initial 64-row composition measured 19.045 ms, and the 128-row
+proxy specialization measures 16.108 ms (29.1% faster than original). With 32
+reproducible uneven documents, the corresponding medians are 8.490 ms, 7.107
+ms, and 6.178 ms (27.2% faster than original). Proxy Q/K gradients still use a
+second launch; a future KV-outer proxy kernel must beat this stronger baseline
+without imposing fixed head counts.
 
 ## Milestone 4: FP8 KV storage with BF16 compute
 

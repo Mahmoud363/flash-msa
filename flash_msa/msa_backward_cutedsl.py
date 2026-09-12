@@ -35,7 +35,10 @@ def _to_cute_tensor(tensor: torch.Tensor) -> cute.Tensor:
 
 
 def _derive_head_tiling(
-    n_heads: int, n_kv_heads: int, n_proxy_heads: int
+    n_heads: int,
+    n_kv_heads: int,
+    n_proxy_heads: int,
+    mma_rows_per_task: int = MMA_ROWS_PER_TASK,
 ) -> tuple[int, int, int, int]:
     """Return ``(main_per_proxy, query_chunk, rows_per_task, proxy_query_rows)``."""
 
@@ -49,14 +52,14 @@ def _derive_head_tiling(
         )
 
     main_per_proxy = int(n_heads) // int(n_proxy_heads)
-    if main_per_proxy <= 0 or MMA_ROWS_PER_TASK % main_per_proxy != 0:
+    if main_per_proxy <= 0 or mma_rows_per_task % main_per_proxy != 0:
         raise NotImplementedError(
-            f"main heads per proxy must divide {MMA_ROWS_PER_TASK}, got {main_per_proxy}"
+            f"main heads per proxy must divide {mma_rows_per_task}, got {main_per_proxy}"
         )
 
-    query_chunk = MMA_ROWS_PER_TASK // main_per_proxy
+    query_chunk = mma_rows_per_task // main_per_proxy
     proxy_query_rows = max(32, query_chunk)
-    return main_per_proxy, query_chunk, MMA_ROWS_PER_TASK, proxy_query_rows
+    return main_per_proxy, query_chunk, mma_rows_per_task, proxy_query_rows
 
 
 @dsl_user_op
@@ -122,12 +125,13 @@ class _MSAFusedBackwardMMAKernel:
         input_query_chunk: int,
         use_document_segments: bool = False,
         proxy_only: bool = False,
+        mma_rows_per_task: int = MMA_ROWS_PER_TASK,
         num_threads: int = 256,
     ) -> None:
         if head_dim != 128:
             raise NotImplementedError(f"fused backward requires D=128, got {head_dim}")
         main_per_proxy, query_chunk, rows_per_task, proxy_query_rows = _derive_head_tiling(
-            int(n_heads), int(n_kv_heads), int(n_proxy_heads)
+            int(n_heads), int(n_kv_heads), int(n_proxy_heads), int(mma_rows_per_task)
         )
 
         self.head_dim = int(head_dim)
@@ -920,8 +924,9 @@ def _compile_fused_backward_kernel(
     stream: cuda.CUstream,
 ):
     num_threads = 256
+    mma_rows_per_task = 128 if proxy_only else MMA_ROWS_PER_TASK
     main_per_proxy, query_chunk, rows_per_task, proxy_query_rows = _derive_head_tiling(
-        n_heads, n_kv_heads, n_proxy_heads
+        n_heads, n_kv_heads, n_proxy_heads, mma_rows_per_task
     )
     key = (
         "fused",
@@ -971,6 +976,7 @@ def _compile_fused_backward_kernel(
             input_query_chunk=input_query_chunk,
             use_document_segments=use_document_segments,
             proxy_only=proxy_only,
+            mma_rows_per_task=mma_rows_per_task,
             num_threads=num_threads,
         )
         _COMPILE_CACHE[key] = cute.compile(
@@ -1044,8 +1050,9 @@ def _run_fused_backward_impl(
 
     if head_dim != 128:
         raise NotImplementedError("fused backward supports only D=128")
+    mma_rows_per_task = 128 if proxy_only else MMA_ROWS_PER_TASK
     _main_per_proxy, query_chunk, _rows_per_task, _proxy_query_rows = _derive_head_tiling(
-        n_heads, n_kv_heads, n_proxy_heads
+        n_heads, n_kv_heads, n_proxy_heads, mma_rows_per_task
     )
     input_query_chunk = int(task_qids_c.shape[1])
     if input_query_chunk < query_chunk or input_query_chunk % query_chunk != 0:
