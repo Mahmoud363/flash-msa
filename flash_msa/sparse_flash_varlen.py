@@ -24,7 +24,10 @@ from flash_msa.reverse_index_cuda import (
 
 
 BLOCK_SIZE = 128
-TASKS_PER_FLASH_CHUNK = int(os.environ.get("MSA_FLASH_TASKS_PER_CHUNK", "256"))
+# Amortize packing, FlashAttention, and online-merge launches over larger remote
+# task groups. The environment override remains useful for memory-constrained
+# workloads and architecture-specific tuning.
+TASKS_PER_FLASH_CHUNK = int(os.environ.get("MSA_FLASH_TASKS_PER_CHUNK", "1024"))
 
 # Had to write this section to set the narrow V head for Proxy LSE varlen flash call
 # to the minimum dim supported on each backend. FA4 on B200 fails with V_dim=8

@@ -71,3 +71,21 @@ This supersedes the 2K case for optimization decisions. The first fixed-length
 work should target backward throughput while avoiding additional indexing and
 launch fragmentation. The native KV-outer forward remains the next structural
 forward optimization.
+
+## Milestone 1: larger remote-task chunks
+
+Increasing the default remote-task chunk from 256 to 1024 amortizes query/KV
+packing, FA3 dispatch, and online-merge launches. The environment variable
+`MSA_FLASH_TASKS_PER_CHUNK` can restore a smaller value for memory-constrained
+cases.
+
+The same fixed-length 16K/Top-K 2K benchmark produced:
+
+- forward median: 10.963 ms, 3.87% faster than baseline;
+- backward median: 23.478 ms, 3.84% faster than baseline;
+- combined median: 34.441 ms, 3.85% faster than baseline.
+
+Fixed-length, document-masked, and batch-size-two document-masked correctness
+tests passed. The chunk iterator is shared by both fixed-length and varlen paths,
+so the launch-amortization change applies to both; varlen may split chunks at
+full/partial segment access-mode boundaries.
