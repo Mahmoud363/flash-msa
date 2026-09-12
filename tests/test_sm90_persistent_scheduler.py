@@ -3,7 +3,7 @@
 import pytest
 import torch
 
-from flash_msa.msa_forward_sm90 import persistent_claim_work
+from flash_msa.msa_forward_sm90 import persistent_claim_work, tma_load_selected_kv
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
@@ -25,3 +25,25 @@ def test_empty_worklist() -> None:
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (9, 0):
         pytest.skip("SM90 test")
     assert persistent_claim_work(0, device="cuda").numel() == 0
+
+
+def test_selected_kv_tiles_are_loaded_with_tma() -> None:
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (9, 0):
+        pytest.skip("SM90 test")
+    torch.manual_seed(19)
+    k = torch.randn(2, 2, 512, 128, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    # [batch, proxy head, key block, query count, edge offset]
+    task_meta = torch.tensor(
+        [[0, 0, 2, 7, 0], [1, 3, 1, 11, 7]],
+        dtype=torch.int32,
+        device="cuda",
+    )
+    copied_k, copied_v = tma_load_selected_kv(
+        k, v, task_meta, n_proxy_heads=4
+    )
+    torch.cuda.synchronize()
+    torch.testing.assert_close(copied_k[0], k[0, 0, 256:384], rtol=0, atol=0)
+    torch.testing.assert_close(copied_v[0], v[0, 0, 256:384], rtol=0, atol=0)
+    torch.testing.assert_close(copied_k[1], k[1, 1, 128:256], rtol=0, atol=0)
+    torch.testing.assert_close(copied_v[1], v[1, 1, 128:256], rtol=0, atol=0)
