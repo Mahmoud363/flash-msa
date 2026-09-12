@@ -9,6 +9,7 @@ consumer.
 from __future__ import annotations
 
 import inspect
+import os
 
 import cutlass
 import torch
@@ -26,6 +27,8 @@ import cutlass.utils.hopper_helpers as sm90_utils
 
 _COMPILE_CACHE = {}
 _NVVM_ATOMICRMW_HAS_RES = "res" in inspect.signature(nvvm.atomicrmw).parameters
+PRODUCER_REGISTERS = int(os.environ.get("MSA_SM90_PRODUCER_REGISTERS", "40"))
+CONSUMER_REGISTERS = int(os.environ.get("MSA_SM90_CONSUMER_REGISTERS", "232"))
 
 
 def _to_cute_tensor(tensor: torch.Tensor) -> cute.Tensor:
@@ -768,8 +771,11 @@ class _SelectedQKWgmmaKernel:
             )
             v_pipe.producer_commit(v_producer_state)
 
+        if warpgroup_idx == 0:
+            cute.arch.setmaxregister_decrease(PRODUCER_REGISTERS)
+
         if warpgroup_idx == 1:
-            cute.arch.setmaxregister_increase(232)
+            cute.arch.setmaxregister_increase(CONSUMER_REGISTERS)
             k_pipe.consumer_wait(consumer_state)
             v_pipe.consumer_wait(v_consumer_state)
 
