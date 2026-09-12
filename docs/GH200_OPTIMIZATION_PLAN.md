@@ -122,13 +122,32 @@ parity, document-masked B=1/B=2 fallback parity, and 12 focused scheduler/TMA/
 WGMMA/FP32-softmax/epilogue tests passed. Detailed evidence is in
 `docs/performance/GH200_BASELINE.md`.
 
-## Milestone 3: FP8 proxy/index branch
+## Milestone 3: FP8 proxy/index branch (complete)
 
 Introduce E4M3 proxy Q/K operands with per-head or per-block scaling. Use Hopper
 FP8 WGMMA with FP32 accumulation, and retain FP32 block maxima and Top-K ranking.
 
 Exit criteria: selection agreement/quality is quantified, training correctness
 meets an explicitly documented FP8 tolerance, and proxy time improves.
+
+Completed on GH200 on 2026-09-12 for the fixed-length SM90 path. Proxy Q/K are
+quantized to E4M3 with one FP32 amax scale per head and 128-token block. Fused
+CuTe quantizers feed a 64x128, two-stage-K TMA/WGMMA selector with FP32
+accumulation, block maxima, and Top-K ranking. Generated PTX contains
+`wgmma.mma_async.sync.aligned.m64n128k32.f32.e4m3.e4m3`.
+
+FP8 selection is intentionally approximate, matching the original design
+intent rather than requiring exact BF16 block IDs. The enforced training gates
+are finite output/loss/all gradients, output cosine >= 0.97, relative loss
+error <= 1%, and cosine >= 0.99 for every proxy/main QKV gradient. Measured
+Top-K recall spans 95.2%-97.4% across the retained 8K-32K quality matrix; both
+B=1 and B=2 training comparisons pass the numerical gates.
+
+At 16K/Top-K 2K the complete proxy-selection stage is 0.638 ms versus 1.031 ms
+for BF16. End-to-end fixed-length forward improves by 3.0% at 16K and 6.1% at
+32K. Smaller 8K/Top-K 512 and larger 16K/Top-K 4096 cases also improve. The
+document-masked path retains exact BF16 selection until the later varlen port.
+Detailed evidence is in `docs/performance/GH200_BASELINE.md`.
 
 ## Milestone 4: FP8 KV storage with BF16 compute
 

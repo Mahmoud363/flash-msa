@@ -139,3 +139,74 @@ ran six times, averaged 2.773 ms, and represented 8.8% of observed GPU kernel
 time. Nsight Compute hardware counters remain unavailable on this node because
 the driver returns `ERR_NVGPUCTRPERM`; this does not affect Nsight Systems CUDA
 and NVTX tracing.
+
+## Milestone 3: E4M3 proxy/index selection
+
+The fixed-length SM90 path now automatically quantizes proxy Q/K to E4M3 and
+runs block selection on Hopper FP8 tensor cores. Each fused quantization CTA
+computes an FP32 amax over one `[128,128]` token/dimension block, writes one
+FP32 scale, and emits E4M3 values. The selector uses 64 query rows, 128 key
+columns, a two-stage TMA K pipeline, and 48/224 producer/consumer registers.
+QK uses FP8 WGMMA with FP32 accumulation; scale application, block maxima, and
+Top-K ranking remain FP32.
+
+The generated SM90a PTX contains
+`wgmma.mma_async.sync.aligned.m64n128k32.f32.e4m3.e4m3`, confirming that this is
+the FP8 tensor-core instruction rather than a storage-only conversion. Set
+`MSA_SELECT_BACKEND=bf16` to restore BF16 selection. FA3 and document-masked
+execution retain BF16 by default; this milestone does not yet port FP8
+selection to variable document segments.
+
+### Approximate-selection policy and numerical gates
+
+FP8 selection is intentionally approximate. Exact-row agreement is reported as
+a diagnostic, not a correctness requirement. The enforced training gates are:
+
+- output, scalar loss, and all five input gradients must be finite;
+- output cosine similarity versus BF16 selection must be at least 0.97;
+- relative scalar-loss error must be at most 1%;
+- every proxy-Q/proxy-K/main-Q/main-K/main-V gradient cosine must be at least
+  0.99.
+
+Random BF16 proxy inputs with seed 67 produced the following schedule metrics:
+
+| Shape | Top-K | Recall@K | Exact rows | Mean symmetric difference |
+|---:|---:|---:|---:|---:|
+| 8K | 512 | 95.60% | 82.62% | 0.352 blocks |
+| 16K | 2048 | 96.07% | 47.20% | 1.257 blocks |
+| 16K | 4096 | 97.37% | 42.19% | 1.684 blocks |
+| 32K | 2048 | 95.19% | 38.04% | 1.538 blocks |
+
+The B=1, 8K/Top-K 2K forward/backward comparison measured output cosine
+0.9815, relative loss error 0.070%, and gradient cosines from 0.9977 to 0.99995.
+The B=2, 4K/Top-K 1K comparison measured output cosine 0.9804, relative loss
+error 0.010%, and gradient cosines from 0.9956 to 0.99996. Both satisfy the
+documented approximate-training gates.
+
+### Performance
+
+The tuned 16K/Top-K 2K proxy stage takes 0.638 ms including fused Q/K
+quantization, versus 1.031 ms for BF16 selection, a 38.1% speedup. Paired
+end-to-end CUDA-event measurements produced:
+
+| Shape | Top-K | BF16-select forward | FP8-select forward | Speedup |
+|---:|---:|---:|---:|---:|
+| 8K | 512 | 2.319 ms | 2.266 ms | 2.3% |
+| 16K | 2048 | 8.870 ms | 8.606 ms | 3.0% |
+| 16K | 4096 | 15.150 ms | 14.167 ms | 6.5% |
+| 32K | 2048 | 18.668 ms | 17.535 ms | 6.1% |
+
+Backward arithmetic remains BF16 and its timings are unchanged within normal
+run variation; only the forward selection schedule is approximate.
+
+Headless Nsight Systems 2025.5.1 reports 0.395 ms average for the FP8 selector,
+20.6 microseconds for proxy-Q quantization, and 13.7 microseconds for proxy-K
+quantization across six traced iterations. The trace contains 773
+`cudaLaunchKernel` calls, the same observed total as the final Milestone 2
+trace. Generated-code inspection supplies the FP8 WGMMA evidence because
+Nsight Compute counters remain blocked by `ERR_NVGPUCTRPERM` on this node.
+
+The full automated suite reports 21 passing tests. Coverage includes exact
+fused-quantizer parity, proxy head mappings 2:1/4:1/4:2/8:2, approximate
+forward/backward stability, the existing SM90 attention tests, and BF16
+document-mask fallback parity at B=2.
