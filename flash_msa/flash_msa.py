@@ -3,6 +3,8 @@
 This module owns the Python boundary for the native fused MSA kernels.
 """
 
+import os
+
 import torch
 
 from flash_msa.msa_select_cutedsl import compute_proxy_lse, select_blocks
@@ -183,9 +185,16 @@ class _SparseAttentionFunction(torch.autograd.Function):
                 "Main q heads / proxy q heads ratio must divide "
                 "NATIVE_MMA_ROWS_PER_TASK evenly"
             )
+        forward_backend = os.environ.get("MSA_FORWARD_BACKEND", "fa3").lower()
+        default_remote_query_chunk = 512 if forward_backend == "sm90" else 1024
         metadata = build_sparse_attention_metadata_cuda(
             block_indices,
             backward_query_chunk=NATIVE_MMA_ROWS_PER_TASK // main_per_proxy,
+            remote_query_chunk=int(
+                os.environ.get(
+                    "MSA_REMOTE_QUERY_CHUNK", str(default_remote_query_chunk)
+                )
+            ),
             document_segments=document_segments,
         )
 
