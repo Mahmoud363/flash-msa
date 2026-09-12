@@ -204,6 +204,38 @@ Reuse KV-outer metadata and TMA/WGMMA pipelines for dQ, dK, dV, and proxy KL
 gradients. Avoid global temporary tensors where online or fused reductions are
 possible.
 
+The implementation target follows the Hopper backward structure in the current
+FlashAttention CuTeDSL kernel rather than applying isolated asynchronous copies
+to the existing all-consumer warp-MMA kernel:
+
+1. one producer warpgroup loads persistent K/V and double-buffered Q/dO with
+   TMA, including segment predicates for document-masked work;
+2. one warpgroup drains FP32 dQ tiles with Hopper bulk reduce-add while two MMA
+   warpgroups run BF16 WGMMA with FP32 accumulators;
+3. a KV-outer work item walks every associated reverse-CSR query tile, keeping
+   dK/dV accumulators resident until the complete KV item is finished;
+4. P and dS stay in registers and become register-sourced WGMMA operands for
+   dV and dK where the selected tile layout permits it;
+5. proxy KL Q/K gradients use the same resident KV work item and reduction
+   epilogues rather than a second edge-oriented schedule.
+
+This structure is supported by the locally installed CuTeDSL 4.4.2 primitives:
+`PipelineTmaAsync`, SM90 `warpgroup.MmaF16BF16Op`, TMA tensor-map construction,
+bulk asynchronous shared/global copies, and the persistent scheduler helpers.
+The upstream references are NVIDIA's
+[WGMMA programming guide](https://github.com/NVIDIA/cutlass/blob/main/media/docs/pythonDSL/mma_docs/wgmma_programming.rst),
+[persistent grouped GEMM example](https://github.com/NVIDIA/cutlass/blob/main/examples/python/CuTeDSL/cute/hopper/kernel/grouped_gemm/grouped_gemm.py),
+and FlashAttention's
+[SM90 backward kernel](https://github.com/Dao-AILab/flash-attention/blob/main/flash_attn/cute/flash_bwd_sm90.py).
+
+Headless Nsight Systems at 16K/Top-K 2K measured the current fused backward at
+20.367 ms per invocation and 70.0% of all traced GPU kernel time. Its retained
+64-row/256-thread geometry beats 32 rows (35.913 ms) and 128 rows (25.244 ms).
+Standalone 128-bit `cp.async` substitutions were rejected: scattered Q/dO
+increased backward latency to 24.359 ms and contiguous K/V to 26.344 ms. Those
+results confirm that overlap and persistent accumulation—not copy width alone—
+are required.
+
 Exit criteria: all gradient gates pass and total forward-plus-backward time
 improves on representative training configurations.
 
