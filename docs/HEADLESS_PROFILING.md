@@ -4,6 +4,8 @@ All profiling commands in this document run without a GUI. Run one ordinary
 benchmark first so CUDA extensions and CuTe kernels are compiled before a trace.
 
 ```bash
+module load Nsight-Systems/2025.5.1 Nsight-Compute/2025.3.1
+source /e/scratch/jureap1/ahmed9/miniforge3/etc/profile.d/conda.sh
 conda activate longvu
 cd /e/scratch/jureap1/ahmed9/repos/evaluation/flash-msa
 python benchmarks/profile_training_case.py \
@@ -59,9 +61,12 @@ ncu --set full --target-processes all --force-overwrite \
 ncu --import flash_msa_kernel.ncu-rep --page summary
 ```
 
-The profiler executables may be installed outside `PATH` on clusters. Common
-locations are under `/opt/nvidia/nsight-systems/*/bin` and
-`/opt/nvidia/nsight-compute/*/ncu`. If neither executable is installed, the JSON
-benchmark still provides stable CUDA-event timings, while profiler collection
-must be performed on a node image containing the NVIDIA tools.
+On this cluster the profilers are environment modules. Load the profiler modules
+before reactivating Conda: module loading can change the default Python and clear
+toolchain variables, while reactivation restores the `longvu` interpreter and
+lets PyTorch discover its CUDA root.
 
+Nsight Compute additionally requires permission to access GPU performance
+counters. If it reports `ERR_NVGPUCTRPERM`, ask the cluster administrator to
+enable performance counters for the job/node. Nsight Systems CUDA and NVTX
+tracing remains usable without those counters.

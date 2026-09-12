@@ -1,0 +1,37 @@
+{
+  "environment": {
+    "hostname": "jpbl-s02-01",
+    "python": "3.12.13",
+    "torch": "2.11.0+cu130",
+    "torch_cuda": "13.0",
+    "gpu": "NVIDIA GH200 480GB",
+    "compute_capability": [
+      9,
+      0
+    ],
+    "gpu_memory_bytes": 102005473280
+  },
+  "case": {
+    "batch_size": 1,
+    "sequence_length": 2048,
+    "top_k": 512,
+    "n_heads": 16,
+    "n_kv_heads": 2,
+    "n_proxy_heads": 4,
+    "n_proxy_kv_heads": 1,
+    "head_dim": 128,
+    "dtype": "bfloat16",
+    "documents_per_row": 4,
+    "warmup": 5,
+    "repeats": 20,
+    "seed": 67
+  },
+  "timing_ms": {
+    "forward_median": 3.6435199975967407,
+    "forward_min": 3.4958078861236572,
+    "forward_max": 4.362112045288086,
+    "backward_median": 3.2635200023651123,
+    "backward_min": 3.0703039169311523,
+    "backward_max": 3.5155839920043945
+  }
+}
