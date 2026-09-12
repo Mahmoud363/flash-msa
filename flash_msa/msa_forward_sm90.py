@@ -32,6 +32,21 @@ def _to_cute_tensor(tensor: torch.Tensor) -> cute.Tensor:
     return from_dlpack(tensor.detach(), assumed_align=16)
 
 
+def _forward_head_tiling(
+    n_heads: int, n_kv_heads: int, n_proxy_heads: int
+) -> tuple[int, int, int]:
+    if n_heads % n_proxy_heads or n_proxy_heads % n_kv_heads:
+        raise ValueError("invalid main/proxy/KV head divisibility")
+    main_per_proxy = int(n_heads) // int(n_proxy_heads)
+    if main_per_proxy > 64 or 64 % main_per_proxy:
+        raise ValueError("main heads per proxy must divide the 64-row WGMMA tile")
+    return (
+        main_per_proxy,
+        64 // main_per_proxy,
+        int(n_proxy_heads) // int(n_kv_heads),
+    )
+
+
 @dsl_user_op
 def _atomic_claim(counter: cute.Tensor, *, loc=None, ip=None) -> Int32:
     """Atomically claim and return one monotonically increasing work index."""
@@ -802,7 +817,15 @@ class _SelectedQKWgmmaKernel:
             for row in cutlass.range_constexpr(cute.size(row_max)):
                 coordinate = coordinates_mn[row, 0]
                 if coordinate[1] == 0:
-                    lse[task_idx, coordinate[0]] = (
+                    lse_flat = cute.make_tensor(
+                        lse.iterator,
+                        cute.make_layout(
+                            lse.shape[0] * lse.shape[1], stride=1
+                        ),
+                    )
+                    lse_flat[
+                        edge_offset * Int32(self.main_per_proxy) + coordinate[0]
+                    ] = (
                         row_max[row] * scale + _math.log(row_sum[row])
                     )
 
@@ -824,7 +847,20 @@ class _SelectedQKWgmmaKernel:
             )
             cute.nvgpu.warpgroup.commit_group()
             cute.nvgpu.warpgroup.wait_group(0)
-            g_output = output[task_idx, None, None]
+            output_flat = cute.make_tensor(
+                output.iterator,
+                cute.make_layout(
+                    (output.shape[0] * output.shape[1], self.block),
+                    stride=(self.block, 1),
+                ),
+            )
+            output_offset = cute.domain_offset(
+                (edge_offset * Int32(self.main_per_proxy), 0), output_flat
+            )
+            g_output = cute.make_tensor(
+                output_offset.iterator,
+                cute.make_layout((self.rows, self.block), stride=(self.block, 1)),
+            )
             tOg = pv_thr_mma.partition_C(g_output)
             for i in cutlass.range_constexpr(cute.size(output_accumulator)):
                 tOg[i] = self._dtype(output_accumulator[i])
@@ -848,15 +884,20 @@ def wgmma_selected_qk(
         raise ValueError("q and k must be on the same CUDA device")
     if q.shape[0] != k.shape[0] or q.shape[2] != k.shape[2]:
         raise ValueError("q and k batch/sequence dimensions must match")
-    if q.shape[1] % n_proxy_heads or n_proxy_heads % k.shape[1]:
-        raise ValueError("invalid main/proxy/KV head divisibility")
+    main_per_proxy, queries_per_tile, proxy_per_kv = _forward_head_tiling(
+        int(q.shape[1]), int(k.shape[1]), int(n_proxy_heads)
+    )
     if task_meta.dtype != torch.int32 or query_indices.dtype != torch.int32:
         raise TypeError("schedule tensors must be int32")
     num_tasks = int(task_meta.shape[0])
     scores = torch.empty((num_tasks, 64, 128), device=q.device, dtype=torch.float32)
     probabilities = torch.empty_like(scores)
     lse = torch.empty((num_tasks, 64), device=q.device, dtype=torch.float32)
-    output = torch.empty((num_tasks, 64, 128), device=q.device, dtype=q.dtype)
+    output = torch.empty(
+        (num_tasks * queries_per_tile, main_per_proxy, 128),
+        device=q.device,
+        dtype=q.dtype,
+    )
     if num_tasks == 0:
         return scores
     q_cute = _to_cute_tensor(q.detach().contiguous())
@@ -867,8 +908,6 @@ def wgmma_selected_qk(
     probabilities_cute = _to_cute_tensor(probabilities)
     lse_cute = _to_cute_tensor(lse)
     stream = cuda.CUstream(torch.cuda.current_stream(q.device).cuda_stream)
-    main_per_proxy = int(q.shape[1]) // int(n_proxy_heads)
-    proxy_per_kv = int(n_proxy_heads) // int(k.shape[1])
     key = ("selected_qk_wgmma", num_tasks, main_per_proxy, proxy_per_kv, q_cute.element_type)
     if key not in _COMPILE_CACHE:
         kernel = _SelectedQKWgmmaKernel(num_tasks, main_per_proxy, proxy_per_kv)
@@ -914,10 +953,21 @@ def wgmma_selected_softmax(
     """Return FP32 normalized probabilities and LSE from fused QK/softmax."""
 
     num_tasks = int(task_meta.shape[0])
+    main_per_proxy, queries_per_tile, proxy_per_kv = _forward_head_tiling(
+        int(q.shape[1]), int(k.shape[1]), int(n_proxy_heads)
+    )
     scores = torch.empty((num_tasks, 64, 128), device=q.device, dtype=torch.float32)
     probabilities = torch.empty_like(scores)
-    lse = torch.empty((num_tasks, 64), device=q.device, dtype=torch.float32)
-    output = torch.empty((num_tasks, 64, 128), device=q.device, dtype=q.dtype)
+    lse = torch.empty(
+        (num_tasks * queries_per_tile, main_per_proxy),
+        device=q.device,
+        dtype=torch.float32,
+    )
+    output = torch.empty(
+        (num_tasks * queries_per_tile, main_per_proxy, 128),
+        device=q.device,
+        dtype=q.dtype,
+    )
     if num_tasks == 0:
         return probabilities, lse
     q_cute = _to_cute_tensor(q.detach().contiguous())
@@ -928,8 +978,6 @@ def wgmma_selected_softmax(
     probabilities_cute = _to_cute_tensor(probabilities)
     lse_cute = _to_cute_tensor(lse)
     stream = cuda.CUstream(torch.cuda.current_stream(q.device).cuda_stream)
-    main_per_proxy = int(q.shape[1]) // int(n_proxy_heads)
-    proxy_per_kv = int(n_proxy_heads) // int(k.shape[1])
     key = ("selected_qk_wgmma", num_tasks, main_per_proxy, proxy_per_kv, q_cute.element_type)
     if key not in _COMPILE_CACHE:
         kernel = _SelectedQKWgmmaKernel(num_tasks, main_per_proxy, proxy_per_kv)
@@ -980,8 +1028,15 @@ def wgmma_selected_attention(
     num_tasks = int(task_meta.shape[0])
     scores = torch.empty((num_tasks, 64, 128), device=q.device, dtype=torch.float32)
     probabilities = torch.empty_like(scores)
-    lse = torch.empty((num_tasks, 64), device=q.device, dtype=torch.float32)
-    output = torch.empty((num_tasks, 64, 128), device=q.device, dtype=q.dtype)
+    main_per_proxy, queries_per_tile, proxy_per_kv = _forward_head_tiling(
+        int(q.shape[1]), int(k.shape[1]), int(n_proxy_heads)
+    )
+    num_edges = int(query_indices.shape[0])
+    edge_capacity = num_tasks * queries_per_tile
+    lse = torch.empty((edge_capacity, main_per_proxy), device=q.device, dtype=torch.float32)
+    output = torch.empty(
+        (edge_capacity, main_per_proxy, 128), device=q.device, dtype=q.dtype
+    )
     if num_tasks == 0:
         return output, lse
     q_cute = _to_cute_tensor(q.detach().contiguous())
@@ -994,8 +1049,6 @@ def wgmma_selected_attention(
     lse_cute = _to_cute_tensor(lse)
     output_cute = _to_cute_tensor(output)
     stream = cuda.CUstream(torch.cuda.current_stream(q.device).cuda_stream)
-    main_per_proxy = int(q.shape[1]) // int(n_proxy_heads)
-    proxy_per_kv = int(n_proxy_heads) // int(k.shape[1])
     key = ("selected_qk_wgmma", num_tasks, main_per_proxy, proxy_per_kv, q_cute.element_type)
     if key not in _COMPILE_CACHE:
         kernel = _SelectedQKWgmmaKernel(num_tasks, main_per_proxy, proxy_per_kv)
@@ -1026,7 +1079,7 @@ def wgmma_selected_attention(
         float(scale),
         stream,
     )
-    return output, lse
+    return output[:num_edges], lse[:num_edges]
 
 
 __all__ = [
