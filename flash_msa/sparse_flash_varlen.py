@@ -225,14 +225,39 @@ def sparse_flash_varlen_forward(
 
         schedule = metadata.kv_outer_schedule
         assert schedule is not None
+        kv_storage = os.environ.get("MSA_KV_STORAGE", "bf16").lower()
+        if kv_storage not in ("bf16", "fp8"):
+            raise ValueError("MSA_KV_STORAGE must be 'bf16' or 'fp8'")
+        attention_kwargs = {}
+        remote_q = q
+        remote_k = k
+        remote_v = attention_v
+        if kv_storage == "fp8":
+            if k.dtype != torch.bfloat16 or attention_v.dtype != torch.bfloat16:
+                raise TypeError("FP8 K/V storage currently requires BF16 K/V inputs")
+            if int(attention_v.shape[-1]) != BLOCK_SIZE:
+                raise ValueError("FP8 K/V storage requires a 128-dimensional V tensor")
+            from flash_msa.msa_kv_fp8 import quantize_kv_e4m3_cutedsl
+            from flash_msa.msa_select_fp8 import quantize_proxy_e4m3_per_block_cutedsl
+
+            storage = quantize_kv_e4m3_cutedsl(k, attention_v)
+            remote_q, q_scale = quantize_proxy_e4m3_per_block_cutedsl(q)
+            remote_k = storage.k
+            remote_v = storage.v
+            attention_kwargs = {
+                "q_scale": q_scale,
+                "k_scale": storage.k_scale,
+                "v_scale": storage.v_scale,
+            }
         remote_out, remote_lse = wgmma_selected_attention(
-            q,
-            k,
-            attention_v,
+            remote_q,
+            remote_k,
+            remote_v,
             schedule.task_meta[: schedule.num_tasks],
             schedule.query_indices[: schedule.num_edges],
             n_proxy_heads=n_proxy_heads,
             scale=float(scale),
+            **attention_kwargs,
         )
         if output_accum is None:
             merge_lse_chunk_cuda(lse_accum, remote_lse, metadata, edge_start=0)
