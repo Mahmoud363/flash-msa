@@ -161,3 +161,27 @@ def test_selected_attention_derives_query_group_width(
     torch.testing.assert_close(
         lse.reshape(-1), logits.logsumexp(dim=-1), rtol=3e-3, atol=3e-3
     )
+
+
+def test_kv_work_item_reuses_tile_across_query_groups() -> None:
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (9, 0):
+        pytest.skip("SM90 test")
+    torch.manual_seed(61)
+    q = torch.randn(1, 16, 512, 128, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(1, 2, 512, 128, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    qids = torch.arange(300, 340, dtype=torch.int32, device="cuda")
+    task_meta = torch.tensor([[0, 1, 1, 40, 0]], dtype=torch.int32, device="cuda")
+    scale = 128**-0.5
+    output, lse = wgmma_selected_attention(
+        q, k, v, task_meta, qids, n_proxy_heads=4, scale=scale
+    )
+    gathered_q = q[0, 4:8, qids.long()].permute(1, 0, 2)
+    logits = torch.einsum(
+        "qhd,kd->qhk", gathered_q.float(), k[0, 0, 128:256].float()
+    ) * scale
+    reference = torch.einsum(
+        "qhk,kd->qhd", logits.softmax(dim=-1), v[0, 0, 128:256].float()
+    )
+    torch.testing.assert_close(output.float(), reference, rtol=1e-2, atol=2e-2)
+    torch.testing.assert_close(lse, logits.logsumexp(dim=-1), rtol=3e-3, atol=3e-3)

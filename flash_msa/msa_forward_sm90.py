@@ -760,112 +760,128 @@ class _SelectedQKWgmmaKernel:
             )
             v_pipe.producer_commit(v_producer_state)
 
-        # Producer warpgroup gathers arbitrary CSR query IDs into the WGMMA
-        # shared-memory A layout while the TMA engine transfers K.
-        if warpgroup_idx == 0:
-            linear = tidx
-            while linear < Int32(self.rows * self.block):
-                row = linear // Int32(self.block)
-                col = linear - row * Int32(self.block)
-                query_slot = row // Int32(self.main_per_proxy)
-                main_offset = row - query_slot * Int32(self.main_per_proxy)
-                valid = query_slot < query_count
-                qid = Int32(0)
-                if valid:
-                    qid = query_indices[edge_offset + query_slot]
-                head = proxy_head * Int32(self.main_per_proxy) + main_offset
-                sQ[row, col, 0] = q[qid, col, head, batch] if valid else self._dtype(0)
-                linear += Int32(128)
-        cute.arch.sync_threads()
-
         if warpgroup_idx == 1:
             cute.arch.setmaxregister_increase(232)
             k_pipe.consumer_wait(consumer_state)
-            wg_thread = tidx - Int32(128)
-            thr_mma = tiled_mma.get_slice(wg_thread)
-            tSsQ = thr_mma.partition_A(sQ)
-            tSsK = thr_mma.partition_B(sK)
-            tSrQ = thr_mma.make_fragment_A(tSsQ)
-            tSrK = thr_mma.make_fragment_B(tSsK)
-            acc_shape = thr_mma.partition_shape_C((self.rows, self.block))
-            acc = thr_mma.make_fragment_C(acc_shape)
-            cute.nvgpu.warpgroup.fence()
-            self._gemm_zero(
-                tiled_mma,
-                tSrQ[(None, None, None, 0)],
-                tSrK[(None, None, None, 0)],
-                acc,
-            )
-            cute.nvgpu.warpgroup.commit_group()
-            cute.nvgpu.warpgroup.wait_group(0)
-            g_scores = scores[task_idx, None, None]
-            tCg = thr_mma.partition_C(g_scores)
-            for i in cutlass.range(cute.size(acc), unroll_full=True):
-                tCg[i] = acc[i]
-            row_max, row_sum = self._softmax_fp32(acc, tiled_mma, scale_log2)
-            g_probabilities = probabilities[task_idx, None, None]
-            tPg = thr_mma.partition_C(g_probabilities)
-            for i in cutlass.range(cute.size(acc), unroll_full=True):
-                tPg[i] = acc[i]
-
-            coordinates = cute.make_identity_tensor((self.rows, self.block))
-            tCoordinates = thr_mma.partition_C(coordinates)
-            coordinates_mn = cute.make_tensor(
-                tCoordinates.iterator,
-                self._layout_acc_mn(tiled_mma, tCoordinates.layout),
-            )
-            for row in cutlass.range_constexpr(cute.size(row_max)):
-                coordinate = coordinates_mn[row, 0]
-                if coordinate[1] == 0:
-                    lse_flat = cute.make_tensor(
-                        lse.iterator,
-                        cute.make_layout(
-                            lse.shape[0] * lse.shape[1], stride=1
-                        ),
-                    )
-                    lse_flat[
-                        edge_offset * Int32(self.main_per_proxy) + coordinate[0]
-                    ] = (
-                        row_max[row] * scale + _math.log(row_sum[row])
-                    )
-
             v_pipe.consumer_wait(v_consumer_state)
-            pv_thr_mma = pv_tiled_mma.get_slice(wg_thread)
-            tOsV = pv_thr_mma.partition_B(sV)
-            tOrV = pv_thr_mma.make_fragment_B(tOsV)
-            probability_operand = self._accumulator_to_operand(
-                acc, pv_tiled_mma.tv_layout_A
-            )
-            output_shape = pv_thr_mma.partition_shape_C((self.rows, self.block))
-            output_accumulator = pv_thr_mma.make_fragment_C(output_shape)
-            cute.nvgpu.warpgroup.fence()
-            self._gemm_zero(
-                pv_tiled_mma,
-                probability_operand,
-                tOrV[(None, None, None, 0)],
-                output_accumulator,
-            )
-            cute.nvgpu.warpgroup.commit_group()
-            cute.nvgpu.warpgroup.wait_group(0)
-            output_flat = cute.make_tensor(
-                output.iterator,
-                cute.make_layout(
-                    (output.shape[0] * output.shape[1], self.block),
-                    stride=(self.block, 1),
-                ),
-            )
-            output_offset = cute.domain_offset(
-                (edge_offset * Int32(self.main_per_proxy), 0), output_flat
-            )
-            g_output = cute.make_tensor(
-                output_offset.iterator,
-                cute.make_layout((self.rows, self.block), stride=(self.block, 1)),
-            )
-            tOg = pv_thr_mma.partition_C(g_output)
-            for i in cutlass.range(
-                cute.size(output_accumulator), unroll_full=True
-            ):
-                tOg[i] = self._dtype(output_accumulator[i])
+
+        queries_per_tile = Int32(self.rows // self.main_per_proxy)
+        query_start = Int32(0)
+        while query_start < query_count:
+            # The producer gathers the next arbitrary CSR query group while
+            # K/V remain resident in shared memory for the entire work item.
+            if warpgroup_idx == 0:
+                linear = tidx
+                while linear < Int32(self.rows * self.block):
+                    row = linear // Int32(self.block)
+                    col = linear - row * Int32(self.block)
+                    tile_slot = row // Int32(self.main_per_proxy)
+                    query_slot = query_start + tile_slot
+                    main_offset = row - tile_slot * Int32(self.main_per_proxy)
+                    valid = query_slot < query_count
+                    qid = Int32(0)
+                    if valid:
+                        qid = query_indices[edge_offset + query_slot]
+                    head = proxy_head * Int32(self.main_per_proxy) + main_offset
+                    sQ[row, col, 0] = (
+                        q[qid, col, head, batch] if valid else self._dtype(0)
+                    )
+                    linear += Int32(128)
+            cute.arch.sync_threads()
+
+            if warpgroup_idx == 1:
+                wg_thread = tidx - Int32(128)
+                thr_mma = tiled_mma.get_slice(wg_thread)
+                tSsQ = thr_mma.partition_A(sQ)
+                tSsK = thr_mma.partition_B(sK)
+                tSrQ = thr_mma.make_fragment_A(tSsQ)
+                tSrK = thr_mma.make_fragment_B(tSsK)
+                acc_shape = thr_mma.partition_shape_C((self.rows, self.block))
+                acc = thr_mma.make_fragment_C(acc_shape)
+                cute.nvgpu.warpgroup.fence()
+                self._gemm_zero(
+                    tiled_mma,
+                    tSrQ[(None, None, None, 0)],
+                    tSrK[(None, None, None, 0)],
+                    acc,
+                )
+                cute.nvgpu.warpgroup.commit_group()
+                cute.nvgpu.warpgroup.wait_group(0)
+                if query_start == 0:
+                    g_scores = scores[task_idx, None, None]
+                    tCg = thr_mma.partition_C(g_scores)
+                    for i in cutlass.range(cute.size(acc), unroll_full=True):
+                        tCg[i] = acc[i]
+                row_max, row_sum = self._softmax_fp32(acc, tiled_mma, scale_log2)
+                if query_start == 0:
+                    g_probabilities = probabilities[task_idx, None, None]
+                    tPg = thr_mma.partition_C(g_probabilities)
+                    for i in cutlass.range(cute.size(acc), unroll_full=True):
+                        tPg[i] = acc[i]
+
+                coordinates = cute.make_identity_tensor((self.rows, self.block))
+                tCoordinates = thr_mma.partition_C(coordinates)
+                coordinates_mn = cute.make_tensor(
+                    tCoordinates.iterator,
+                    self._layout_acc_mn(tiled_mma, tCoordinates.layout),
+                )
+                lse_flat = cute.make_tensor(
+                    lse.iterator,
+                    cute.make_layout(lse.shape[0] * lse.shape[1], stride=1),
+                )
+                for row in cutlass.range_constexpr(cute.size(row_max)):
+                    coordinate = coordinates_mn[row, 0]
+                    if coordinate[1] == 0:
+                        lse_flat[
+                            (edge_offset + query_start)
+                            * Int32(self.main_per_proxy)
+                            + coordinate[0]
+                        ] = row_max[row] * scale + _math.log(row_sum[row])
+
+                pv_thr_mma = pv_tiled_mma.get_slice(wg_thread)
+                tOsV = pv_thr_mma.partition_B(sV)
+                tOrV = pv_thr_mma.make_fragment_B(tOsV)
+                probability_operand = self._accumulator_to_operand(
+                    acc, pv_tiled_mma.tv_layout_A
+                )
+                output_shape = pv_thr_mma.partition_shape_C((self.rows, self.block))
+                output_accumulator = pv_thr_mma.make_fragment_C(output_shape)
+                cute.nvgpu.warpgroup.fence()
+                self._gemm_zero(
+                    pv_tiled_mma,
+                    probability_operand,
+                    tOrV[(None, None, None, 0)],
+                    output_accumulator,
+                )
+                cute.nvgpu.warpgroup.commit_group()
+                cute.nvgpu.warpgroup.wait_group(0)
+                output_flat = cute.make_tensor(
+                    output.iterator,
+                    cute.make_layout(
+                        (output.shape[0] * output.shape[1], self.block),
+                        stride=(self.block, 1),
+                    ),
+                )
+                output_offset = cute.domain_offset(
+                    (
+                        (edge_offset + query_start) * Int32(self.main_per_proxy),
+                        0,
+                    ),
+                    output_flat,
+                )
+                g_output = cute.make_tensor(
+                    output_offset.iterator,
+                    cute.make_layout(
+                        (self.rows, self.block), stride=(self.block, 1)
+                    ),
+                )
+                tOg = pv_thr_mma.partition_C(g_output)
+                for i in cutlass.range(
+                    cute.size(output_accumulator), unroll_full=True
+                ):
+                    tOg[i] = self._dtype(output_accumulator[i])
+            cute.arch.sync_threads()
+            query_start += queries_per_tile
 
 
 def wgmma_selected_qk(
@@ -1034,7 +1050,8 @@ def wgmma_selected_attention(
         int(q.shape[1]), int(k.shape[1]), int(n_proxy_heads)
     )
     num_edges = int(query_indices.shape[0])
-    edge_capacity = num_tasks * queries_per_tile
+    # The final WGMMA tile writes predicated padding rows after the last edge.
+    edge_capacity = num_edges + queries_per_tile - 1
     lse = torch.empty((edge_capacity, main_per_proxy), device=q.device, dtype=torch.float32)
     output = torch.empty(
         (edge_capacity, main_per_proxy, 128), device=q.device, dtype=q.dtype
