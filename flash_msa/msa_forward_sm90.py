@@ -12,7 +12,7 @@ import os
 import cutlass
 import torch
 from cuda.bindings import driver as cuda
-from cutlass import Int32, cute
+from cutlass import Int32, Int64, cute
 from cutlass._mlir.dialects import nvvm
 from cutlass._mlir.dialects import math as _math
 from cutlass.cute.runtime import from_dlpack
@@ -1161,6 +1161,11 @@ class _SelectedQKWgmmaKernel:
             if not active:
                 query_count = Int32(0)
             edge_offset = task_meta[task_idx, 4]
+            # The edge-major partial output can contain more than 2**31
+            # elements at long context (for example, 128K with four main
+            # heads per proxy).  Keep address-producing edge arithmetic in
+            # i64 even though the compact schedule itself uses i32 indices.
+            edge_offset_i64 = Int64(edge_offset)
             kv_head = proxy_head // Int32(self.proxy_per_kv)
 
             gK = cute.local_tile(
@@ -1381,9 +1386,9 @@ class _SelectedQKWgmmaKernel:
                         coordinate = coordinates_mn[row, 0]
                         if coordinate[1] == 0:
                             lse_flat[
-                                (edge_offset + query_start)
-                                * Int32(self.main_per_proxy)
-                                + coordinate[0]
+                                (edge_offset_i64 + Int64(query_start))
+                                * Int64(self.main_per_proxy)
+                                + Int64(coordinate[0])
                             ] = (
                                 row_max[row] * row_attention_scale[row]
                                 + _math.log(row_sum[row])
@@ -1415,7 +1420,8 @@ class _SelectedQKWgmmaKernel:
                     )
                     output_offset = cute.domain_offset(
                         (
-                            (edge_offset + query_start) * Int32(self.main_per_proxy),
+                            (edge_offset_i64 + Int64(query_start))
+                            * Int64(self.main_per_proxy),
                             0,
                         ),
                         output_flat,
