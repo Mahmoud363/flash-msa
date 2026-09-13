@@ -31,38 +31,110 @@ or
 ```
 uv pip install -e . --no-build-isolation
 ```
-# Usage
+# Training with the SM90 kernels
+
+The public training APIs consume projected tensors in `(batch, heads, sequence,
+128)` layout. `Q_proxy` and `K_proxy` belong to the indexer/proxy branch, while
+`Q`, `K`, and `V` belong to the main attention branch. The optimized Hopper path
+uses FP8 E4M3 proxy selection with FP32 ranking, native SM90 sparse
+forward/backward kernels, BF16 main-attention tensors, and FP32 softmax/LSE
+accumulation by default. No environment variables are required to enable it.
+
+## Warm-up stage
+
+Use dense causal warm-up attention while training the proxy/indexer before its
+block selections are reliable:
+
+```python
+from flash_msa import flash_msa_func_warmup
+
+attn_out, kl_loss = flash_msa_func_warmup(
+    Q_proxy,
+    K_proxy,
+    Q,
+    K,
+    V,
+    top_k,
+    head_dim**-0.5,
+)
+
+task_loss = loss_fn(attn_out, targets)
+loss = task_loss + kl_weight * kl_loss
+loss.backward()
 ```
+
+Warm-up attention is dense rather than top-k sparse; `top_k` is accepted for API
+compatibility but does not change its attention pattern. Include `kl_loss` in
+the objective during this stage so backward computes the proxy Q/K training
+signal.
+
+## Normal sparse-training stage
+
+After warm-up, switch to `flash_msa_func`. The FP8 proxy selector chooses
+`top_k / 128` KV blocks and the SM90 kernels perform the sparse main-attention
+forward and backward:
+
+```python
 from flash_msa import flash_msa_func
-attn_out, kl_loss = flash_msa_func(Q_proxy, K_proxy, Q, K, V, top_k, head_dim ** -0.5)
-```
-For packed-document self-attention, pass FA4-style cumulative document offsets:
-```
+
 attn_out, kl_loss = flash_msa_func(
-    Q_proxy, K_proxy, Q, K, V, top_k, head_dim ** -0.5,
+    Q_proxy,
+    K_proxy,
+    Q,
+    K,
+    V,
+    top_k,                 # number of selected tokens; must be a multiple of 128
+    head_dim**-0.5,
+)
+
+task_loss = loss_fn(attn_out, targets)
+loss = task_loss + kl_weight * kl_loss
+loss.backward()
+```
+
+`kl_loss` is a zero-valued autograd placeholder, not a materialized forward KL
+value. Including it in the loss activates the on-the-fly proxy KL gradients in
+backward; `kl_weight` scales those gradients. Consequently, logging the returned
+placeholder does not report the actual KL-divergence value.
+
+To train only the main sparse-attention branch and deactivate proxy KL backward,
+leave the placeholder out of the loss:
+
+```python
+attn_out, _ = flash_msa_func(
+    Q_proxy, K_proxy, Q, K, V, top_k, head_dim**-0.5
+)
+loss = loss_fn(attn_out, targets)  # no kl_loss term
+loss.backward()
+```
+
+On the default SM90 path, omitting `kl_loss` also skips proxy LSE and proxy-gradient
+work during backward. The FP8 proxy selector is still used in forward to choose
+the sparse blocks; only its KL training signal is disabled.
+
+## Packed documents / variable-length sequences
+
+Both stages accept FA4-style cumulative document offsets:
+
+```python
+# Dense warm-up stage
+attn_out, kl_loss = flash_msa_func_warmup(
+    Q_proxy, K_proxy, Q, K, V, top_k, head_dim**-0.5,
+    cu_seqlens=cu_seqlens,
+)
+
+# Normal sparse-training stage
+attn_out, kl_loss = flash_msa_func(
+    Q_proxy, K_proxy, Q, K, V, top_k, head_dim**-0.5,
     cu_seqlens=cu_seqlens,
 )
 ```
-`cu_seqlens` must be a one-dimensional CUDA `int32` tensor over flattened `B * S`
-tokens and contain every batch-row boundary. The legacy `[B, S]` `document_list`
-argument remains supported; the two formats are mutually exclusive. Flash-MSA
-accepts already projected Q/K tensors, so RoPE positions must be reset at each
-document boundary before calling it. `flash_msa_warmup_func` accepts the same
-`cu_seqlens` keyword for document-masked dense warmup.
 
-or
-```
-from flash_msa import flash_msa_warmup_func
-attn_out, kl_loss = flash_msa_warmup_func(Q_proxy, K_proxy, Q, K, V, top_k, head_dim ** -0.5)
-```
-
-Note that kl_loss in the forward is just a torch.zeros placeholder, but after adding it to the main model loss, calling backward() will activate the on-the-fly gradient calcs equivalent to the actual proxy KL loss signal.
-
-On Hopper, Flash-MSA defaults to the native SM90 forward/backward kernels, FP8 E4M3
-proxy selection with FP32 ranking, and BF16 main-attention storage. These
-defaults apply to fixed-length and packed-document/varlen inputs. Set
-`MSA_FORWARD_BACKEND=fa3`, `MSA_BACKWARD_BACKEND=legacy`, or
-`MSA_SELECT_BACKEND=bf16` to request the compatibility paths explicitly.
+`cu_seqlens` must be a one-dimensional CUDA `int32` tensor indexing the
+flattened `B * S` token dimension, and it must contain every batch-row boundary.
+The sparse API also retains the `[B, S]` `document_list` argument; do not pass it
+together with `cu_seqlens`. Because Flash-MSA receives already projected Q/K
+tensors, the caller must reset RoPE positions at every document boundary.
 
 # Caveats
 
@@ -83,11 +155,14 @@ Test sparse MSA correctness against an eager implementation of MSA: `python test
 
 Test warmup MSA correctness against an eager implementation of MSA: `python tests/test_warmup_eager_match.py [args]`
 
-# Training
+# Integration notes
 
 An MSA training example is implemented in this [Megatron-LM fork](https://github.com/nanduruganesh/Megatron-LM). 
 
-Notably, you must add the kl_loss returned by MSA kernels to the model's main CE loss before backward to train the proxy attention. The kl_loss is currently treated as a torch.zeros` placeholder and calculated on-the-fly in the backward, so logging the kl_loss will not reflect how proxy training is actually going. Some solutions to get some signal on proxy training are logging grad/update norms of proxy weights, or patching the forward kernel to calculate and accumulate KL div, but only doing this once every n steps to amortize how slow this would make the forward.
+To monitor proxy training, log proxy gradient/update norms rather than the
+zero-valued `kl_loss` placeholder. Another option is to materialize and
+accumulate the KL divergence in a separate diagnostic pass every N steps, which
+avoids adding that overhead to every forward call.
 
 In general if you are going to train with this it is highly recommended to follow tips from [the paper](https://arxiv.org/abs/2606.13392), use MSA warmup before turning on MSA sparse training, and replicate any transformations to the main attention queries and keys (RoPE, QK norm, QK clip, etc) to the proxy queries and keys to improve proxy convergence.
 
