@@ -11,6 +11,7 @@ import os
 
 import torch
 
+from flash_msa.msa_kv_fp8 import MixedFP8QKV
 from flash_msa._flash_attn_compat import (
     flash_attn_supports_narrow_value_dim,
     flash_attn_varlen_forward,
@@ -24,7 +25,10 @@ from flash_msa.reverse_index_cuda import (
 
 
 BLOCK_SIZE = 128
-TASKS_PER_FLASH_CHUNK = int(os.environ.get("MSA_FLASH_TASKS_PER_CHUNK", "256"))
+# Amortize packing, FlashAttention, and online-merge launches over larger remote
+# task groups. The environment override remains useful for memory-constrained
+# workloads and architecture-specific tuning.
+TASKS_PER_FLASH_CHUNK = int(os.environ.get("MSA_FLASH_TASKS_PER_CHUNK", "1024"))
 
 # Had to write this section to set the narrow V head for Proxy LSE varlen flash call
 # to the minimum dim supported on each backend. FA4 on B200 fails with V_dim=8
@@ -47,19 +51,23 @@ def _local_block_attention(
     v: torch.Tensor,
     *,
     scale: float,
+    cu_seqlens: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Run causal attention independently inside every local 128-token block."""
+    """Run causal attention independently inside each local block or segment."""
 
     batch, n_heads, seq_len, head_dim = map(int, q.shape)
     n_kv_heads = int(k.shape[1])
     value_dim = int(v.shape[-1])
     total_tokens = batch * seq_len
-    num_sequences = total_tokens // BLOCK_SIZE
-    cu_seqlens = torch.arange(
-        num_sequences + 1,
-        device=q.device,
-        dtype=torch.int32,
-    ) * BLOCK_SIZE
+    if cu_seqlens is None:
+        num_sequences = total_tokens // BLOCK_SIZE
+        cu_seqlens = torch.arange(
+            num_sequences + 1,
+            device=q.device,
+            dtype=torch.int32,
+        ) * BLOCK_SIZE
+    else:
+        cu_seqlens = cu_seqlens.to(device=q.device, dtype=torch.int32).contiguous()
 
     q_tokens = q.transpose(1, 2).contiguous().view(total_tokens, n_heads, head_dim)
     k_tokens = k.transpose(1, 2).contiguous().view(total_tokens, n_kv_heads, head_dim)
@@ -89,6 +97,49 @@ def _chunk_bounds(
     return edge_start, edge_end
 
 
+def _remote_task_chunks(metadata: SparseAttentionMetadata):
+    """Yield bounded contiguous task runs with a shared KV access mode."""
+
+    if metadata.document_segments is None:
+        for task_start in range(
+            0, metadata.num_remote_tasks, TASKS_PER_FLASH_CHUNK
+        ):
+            yield (
+                task_start,
+                min(task_start + TASKS_PER_FLASH_CHUNK, metadata.num_remote_tasks),
+                True,
+            )
+        return
+
+    segments = metadata.document_segments
+    full_segments_cpu = segments.full_segments_cpu
+    if full_segments_cpu is None:
+        full_segments_cpu = (
+            (segments.starts.remainder(BLOCK_SIZE) == 0)
+            & (segments.lengths == BLOCK_SIZE)
+        ).cpu()
+        segments.full_segments_cpu = full_segments_cpu
+    task_segment_ids = metadata.remote_task_meta_cpu[
+        : metadata.num_remote_tasks, 2
+    ].long()
+    use_paged_by_task = full_segments_cpu[task_segment_ids].tolist()
+
+    task_start = 0
+    while task_start < metadata.num_remote_tasks:
+        use_paged = bool(use_paged_by_task[task_start])
+        task_end_limit = min(
+            task_start + TASKS_PER_FLASH_CHUNK, metadata.num_remote_tasks
+        )
+        task_end = task_start + 1
+        while (
+            task_end < task_end_limit
+            and bool(use_paged_by_task[task_end]) == use_paged
+        ):
+            task_end += 1
+        yield task_start, task_end, use_paged
+        task_start = task_end
+
+
 def sparse_flash_varlen_forward(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -97,6 +148,8 @@ def sparse_flash_varlen_forward(
     metadata: SparseAttentionMetadata,
     scale: float,
     return_output: bool = True,
+    prequantized_qkv: MixedFP8QKV | None = None,
+    kv_storage_override: str | None = None,
 ) -> tuple[torch.Tensor | None, torch.Tensor]:
     """Return selected-block output (optionally) and LSE using bounded chunks."""
 
@@ -137,7 +190,15 @@ def sparse_flash_varlen_forward(
             dtype=v.dtype,
         )
     local_out, local_lse_hs = _local_block_attention(
-        q, k, attention_v, scale=float(scale)
+        q,
+        k,
+        attention_v,
+        scale=float(scale),
+        cu_seqlens=(
+            None
+            if metadata.document_segments is None
+            else metadata.document_segments.cu_seqlens
+        ),
     )
     lse_accum = (
         local_lse_hs.transpose(0, 1)
@@ -157,6 +218,115 @@ def sparse_flash_varlen_forward(
     else:
         output_accum = None
 
+    use_sm90_forward = (
+        os.environ.get("MSA_FORWARD_BACKEND", "sm90").lower() == "sm90"
+        and metadata.kv_outer_schedule is not None
+    )
+    if use_sm90_forward and metadata.num_remote_tasks:
+        from flash_msa.msa_forward_sm90 import wgmma_selected_attention
+
+        schedule = metadata.kv_outer_schedule
+        assert schedule is not None
+        kv_storage = (
+            os.environ.get("MSA_KV_STORAGE", "bf16")
+            if kv_storage_override is None
+            else kv_storage_override
+        ).lower()
+        if kv_storage not in ("bf16", "fp8"):
+            raise ValueError("MSA_KV_STORAGE must be 'bf16' or 'fp8'")
+        if prequantized_qkv is not None and kv_storage != "fp8":
+            raise ValueError("prequantized_qkv requires MSA_KV_STORAGE=fp8")
+        attention_kwargs = {}
+        remote_q = q
+        remote_k = k
+        remote_v = attention_v
+        if kv_storage == "fp8":
+            if prequantized_qkv is None:
+                raise ValueError(
+                    "MSA_KV_STORAGE=fp8 requires prequantized_qkv from the Q/K/V branch"
+                )
+            if k.dtype != torch.bfloat16 or attention_v.dtype != torch.bfloat16:
+                raise TypeError("mixed FP8-QK/BF16-PV currently requires BF16 source tensors")
+            if int(attention_v.shape[-1]) != BLOCK_SIZE:
+                raise ValueError("FP8 K/V storage requires a 128-dimensional V tensor")
+            expected_q_scale = (batch, n_heads, num_blocks)
+            expected_kv_scale = (batch, n_kv_heads, num_blocks)
+            for name, packed, source in (
+                ("q", prequantized_qkv.q, q),
+                ("k", prequantized_qkv.k, k),
+                ("v", prequantized_qkv.v, attention_v),
+            ):
+                if packed.shape != source.shape or packed.device != source.device:
+                    raise ValueError(
+                        f"prequantized {name} must match its BF16 source shape and device"
+                    )
+                if packed.dtype != torch.float8_e4m3fn:
+                    raise TypeError(f"prequantized {name} must use E4M3 storage")
+            for name, packed_scale, expected in (
+                ("q", prequantized_qkv.q_scale, expected_q_scale),
+                ("k", prequantized_qkv.k_scale, expected_kv_scale),
+                ("v", prequantized_qkv.v_scale, expected_kv_scale),
+            ):
+                if packed_scale.shape != expected or packed_scale.dtype != torch.float32:
+                    raise ValueError(
+                        f"prequantized {name}_scale must be FP32 with shape {expected}"
+                    )
+            remote_q = prequantized_qkv.q
+            remote_k = prequantized_qkv.k
+            remote_v = prequantized_qkv.v
+            attention_kwargs = {
+                "q_scale": prequantized_qkv.q_scale,
+                "k_scale": prequantized_qkv.k_scale,
+                "v_scale": prequantized_qkv.v_scale,
+            }
+        remote_out, remote_lse = wgmma_selected_attention(
+            remote_q,
+            remote_k,
+            remote_v,
+            schedule.task_meta[: schedule.num_tasks],
+            schedule.query_indices[: schedule.num_edges],
+            n_proxy_heads=n_proxy_heads,
+            scale=float(scale),
+            segment_starts=(
+                None
+                if metadata.document_segments is None
+                else metadata.document_segments.starts
+            ),
+            segment_lengths=(
+                None
+                if metadata.document_segments is None
+                else metadata.document_segments.lengths
+            ),
+            **attention_kwargs,
+        )
+        if output_accum is None:
+            merge_lse_chunk_cuda(lse_accum, remote_lse, metadata, edge_start=0)
+        else:
+            merge_attention_chunk_cuda(
+                output_accum,
+                lse_accum,
+                remote_out,
+                remote_lse,
+                metadata,
+                edge_start=0,
+            )
+        lse = (
+            lse_accum.view(batch, n_proxy_heads, seq_len, main_per_proxy)
+            .permute(0, 1, 3, 2)
+            .contiguous()
+            .view(batch, n_heads, seq_len)
+        )
+        if output_accum is None:
+            return None, lse
+        output = (
+            output_accum.to(q.dtype)
+            .view(batch, n_proxy_heads, seq_len, main_per_proxy, head_dim)
+            .permute(0, 1, 3, 2, 4)
+            .contiguous()
+            .view(batch, n_heads, seq_len, head_dim)
+        )
+        return output, lse
+
     q_grouped = q.reshape(
         batch, n_proxy_heads, main_per_proxy, seq_len, head_dim
     ).permute(0, 1, 3, 2, 4)
@@ -166,8 +336,7 @@ def sparse_flash_varlen_forward(
     k_pages = k.view(-1, BLOCK_SIZE, 1, head_dim)
     v_pages = attention_v.view(-1, BLOCK_SIZE, 1, value_dim)
 
-    for task_start in range(0, metadata.num_remote_tasks, TASKS_PER_FLASH_CHUNK):
-        task_end = min(task_start + TASKS_PER_FLASH_CHUNK, metadata.num_remote_tasks)
+    for task_start, task_end, use_paged_kv in _remote_task_chunks(metadata):
         edge_start, edge_end = _chunk_bounds(metadata, task_start, task_end)
         edge_count = edge_end - edge_start
         if edge_count == 0:
@@ -189,31 +358,83 @@ def sparse_flash_varlen_forward(
 
         task_batch = task_meta[:, 0].long()
         task_proxy = task_meta[:, 1].long()
-        task_block = task_meta[:, 2].long()
-        physical_page = (
-            (task_batch * n_kv_heads + proxy_to_kv[task_proxy]) * num_blocks
-            + task_block
-        ).to(torch.int32).view(-1, 1)
-        paged_result = flash_attn_varlen_paged_forward(
-            q=packed_q,
-            k_pages=k_pages,
-            v_pages=v_pages,
-            cu_seqlens_q=cu_seqlens_q,
-            page_table=physical_page,
-            max_seqlen_q=metadata.remote_query_chunk,
-            max_seqlen_k=BLOCK_SIZE,
-            softmax_scale=float(scale),
-            causal=False,
-        )
-        if paged_result is None:
-            packed_k = k_pages[physical_page[:, 0].long()].reshape(-1, 1, head_dim)
-            packed_v = v_pages[physical_page[:, 0].long()].reshape(-1, 1, value_dim)
-            cu_seqlens_k = torch.arange(
-                task_end - task_start + 1,
-                device=q.device,
-                dtype=torch.int32,
-            ) * BLOCK_SIZE
-            paged_result = flash_attn_varlen_forward(
+        task_key_unit = task_meta[:, 2].long()
+        if use_paged_kv:
+            if metadata.document_segments is None:
+                task_block = task_key_unit
+            else:
+                task_block = (
+                    metadata.document_segments.starts[task_key_unit].long()
+                    // BLOCK_SIZE
+                )
+            physical_page = (
+                (task_batch * n_kv_heads + proxy_to_kv[task_proxy]) * num_blocks
+                + task_block
+            ).to(torch.int32).view(-1, 1)
+            remote_result = flash_attn_varlen_paged_forward(
+                q=packed_q,
+                k_pages=k_pages,
+                v_pages=v_pages,
+                cu_seqlens_q=cu_seqlens_q,
+                page_table=physical_page,
+                max_seqlen_q=metadata.remote_query_chunk,
+                max_seqlen_k=BLOCK_SIZE,
+                softmax_scale=float(scale),
+                causal=False,
+            )
+            if remote_result is None:
+                packed_k = k_pages[physical_page[:, 0].long()].reshape(
+                    -1, 1, head_dim
+                )
+                packed_v = v_pages[physical_page[:, 0].long()].reshape(
+                    -1, 1, value_dim
+                )
+                cu_seqlens_k = torch.arange(
+                    task_end - task_start + 1,
+                    device=q.device,
+                    dtype=torch.int32,
+                ) * BLOCK_SIZE
+                remote_result = flash_attn_varlen_forward(
+                    q=packed_q,
+                    k=packed_k,
+                    v=packed_v,
+                    cu_seqlens_q=cu_seqlens_q,
+                    cu_seqlens_k=cu_seqlens_k,
+                    max_seqlen_q=metadata.remote_query_chunk,
+                    max_seqlen_k=BLOCK_SIZE,
+                    softmax_scale=float(scale),
+                    causal=False,
+                )
+        else:
+            assert metadata.document_segments is not None
+            segments = metadata.document_segments
+            task_lengths = segments.lengths[task_key_unit].to(torch.int32)
+            cu_seqlens_k = torch.cat(
+                (
+                    torch.zeros(1, device=q.device, dtype=torch.int32),
+                    task_lengths.cumsum(dim=0, dtype=torch.int32),
+                )
+            )
+            token_offsets = torch.arange(BLOCK_SIZE, device=q.device)
+            valid_tokens = token_offsets.unsqueeze(0) < task_lengths.long().unsqueeze(1)
+            token_positions = (
+                segments.starts[task_key_unit].long().unsqueeze(1)
+                + token_offsets.unsqueeze(0)
+            ).clamp_max(seq_len - 1)
+            task_kv_head = proxy_to_kv[task_proxy]
+            padded_k = k[
+                task_batch.unsqueeze(1),
+                task_kv_head.unsqueeze(1),
+                token_positions,
+            ]
+            padded_v = attention_v[
+                task_batch.unsqueeze(1),
+                task_kv_head.unsqueeze(1),
+                token_positions,
+            ]
+            packed_k = padded_k[valid_tokens].unsqueeze(1).contiguous()
+            packed_v = padded_v[valid_tokens].unsqueeze(1).contiguous()
+            remote_result = flash_attn_varlen_forward(
                 q=packed_q,
                 k=packed_k,
                 v=packed_v,
@@ -224,7 +445,7 @@ def sparse_flash_varlen_forward(
                 softmax_scale=float(scale),
                 causal=False,
             )
-        remote_out, remote_lse_hs = paged_result
+        remote_out, remote_lse_hs = remote_result
         remote_lse = remote_lse_hs.transpose(0, 1).contiguous()
         if output_accum is None:
             merge_lse_chunk_cuda(

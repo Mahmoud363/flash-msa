@@ -3,13 +3,21 @@
 This module owns the Python boundary for the native fused MSA kernels.
 """
 
+import os
+
 import torch
 
+from flash_msa.msa_kv_fp8 import MixedFP8QKV
 from flash_msa.msa_select_cutedsl import compute_proxy_lse, select_blocks
 from flash_msa.msa_backward_cutedsl import run_fused_backward
+from flash_msa.msa_backward_sm90 import wgmma_kv_row_backward_main
 from flash_msa.msa_forward_cutedsl import run_main_forward
 from flash_msa.reverse_index_cuda import (
+    DocumentSegmentMetadata,
+    KVOuterSchedule,
     SparseAttentionMetadata,
+    build_document_segment_metadata,
+    build_document_segment_metadata_from_cu_seqlens,
     build_sparse_attention_metadata_cuda,
 )
 
@@ -89,14 +97,49 @@ def _run_fused_selected_edge_backward(
             "NATIVE_MMA_ROWS_PER_TASK evenly"
         )
 
+    delta_main = (o_main.float() * grad_o_main.float()).sum(dim=-1)
+    backward_backend = os.environ.get(
+        "MSA_BACKWARD_BACKEND",
+        "sm90"
+        if os.environ.get("MSA_FORWARD_BACKEND", "sm90").lower() == "sm90"
+        else "legacy",
+    ).lower()
+    if backward_backend not in ("legacy", "sm90"):
+        raise ValueError("MSA_BACKWARD_BACKEND must be 'legacy' or 'sm90'")
+    if backward_backend == "sm90" and grad_kl is None:
+        schedule = metadata.kv_outer_schedule
+        if schedule is None:
+            raise RuntimeError("SM90 backward requires the saved KV-outer schedule")
+        segments = metadata.document_segments
+        dq, dk, dv = wgmma_kv_row_backward_main(
+            q,
+            k,
+            v,
+            grad_o_main,
+            lse_main,
+            delta_main,
+            schedule.row_ptr,
+            schedule.query_indices[: schedule.num_edges],
+            n_proxy_heads=int(n_proxy_heads),
+            scale=float(scale),
+            segment_starts=None if segments is None else segments.starts,
+            segment_lengths=None if segments is None else segments.lengths,
+            segment_batches=None if segments is None else segments.batches,
+        )
+        return (
+            torch.zeros_like(q_proxy),
+            torch.zeros_like(k_proxy),
+            dq.to(q.dtype),
+            dk.to(k.dtype),
+            dv.to(v.dtype),
+        )
+
     lse_proxy = compute_proxy_lse(
         q_proxy,
         k_proxy,
         scale=float(scale),
         metadata=metadata,
     )
-
-    delta_main = (o_main.float() * grad_o_main.float()).sum(dim=-1)
     # Proxy KL gradients are linear in the upstream scalar.  Run the native
     # kernel at the static normalization scale, then apply the CUDA scalar to
     # only the proxy gradients.  This avoids the synchronizing ``.item()`` that
@@ -104,6 +147,52 @@ def _run_fused_selected_edge_backward(
     proxy_grad_scale = (
         0.0 if grad_kl is None else 1.0 / float(bsz * n_proxy_heads * seq_len)
     )
+    if backward_backend == "sm90":
+        schedule = metadata.kv_outer_schedule
+        assert schedule is not None and grad_kl is not None
+        segments = metadata.document_segments
+        dq, dk, dv = wgmma_kv_row_backward_main(
+            q,
+            k,
+            v,
+            grad_o_main,
+            lse_main,
+            delta_main,
+            schedule.row_ptr,
+            schedule.query_indices[: schedule.num_edges],
+            n_proxy_heads=int(n_proxy_heads),
+            scale=float(scale),
+            segment_starts=None if segments is None else segments.starts,
+            segment_lengths=None if segments is None else segments.lengths,
+            segment_batches=None if segments is None else segments.batches,
+        )
+        dq_proxy, dk_proxy, *_unused_main = run_fused_backward(
+            q_proxy,
+            k_proxy,
+            q,
+            k,
+            v,
+            grad_o_main,
+            lse_main,
+            lse_proxy,
+            delta_main,
+            metadata.task_meta,
+            metadata.task_qids,
+            scale=float(scale),
+            grad_kl_scale=proxy_grad_scale,
+            document_segments=metadata.document_segments,
+            proxy_only=True,
+        )
+        proxy_multiplier = grad_kl.detach().to(
+            device=q.device, dtype=dq_proxy.dtype
+        )
+        return (
+            dq_proxy * proxy_multiplier,
+            dk_proxy * proxy_multiplier.to(dtype=dk_proxy.dtype),
+            dq.to(q.dtype),
+            dk.to(k.dtype),
+            dv.to(v.dtype),
+        )
     dq_proxy, dk_proxy, dq, dk, dv = run_fused_backward(
         q_proxy,
         k_proxy,
@@ -118,6 +207,7 @@ def _run_fused_selected_edge_backward(
         metadata.task_qids,
         scale=float(scale),
         grad_kl_scale=proxy_grad_scale,
+        document_segments=metadata.document_segments,
     )
     if grad_kl is not None:
         proxy_multiplier = grad_kl.detach().to(device=q.device, dtype=dq_proxy.dtype)
@@ -137,17 +227,42 @@ class _SparseAttentionFunction(torch.autograd.Function):
         v: torch.Tensor,
         top_k: int,
         scale: float,
+        document_list: torch.Tensor | None,
+        cu_seqlens: torch.Tensor | None,
+        prequantized_qkv: MixedFP8QKV | None,
     ):
+        ctx.set_materialize_grads(False)
         b, n_proxy_heads, s, head_dim = q_proxy.shape
         n_heads = q.shape[1]
         n_kv_heads = k.shape[1]
         num_blocks, top_k_blocks = _validate_inputs(q_proxy, k_proxy, q, k, v, int(top_k))
+        if document_list is not None and cu_seqlens is not None:
+            raise ValueError("document_list and cu_seqlens are mutually exclusive")
+
+        document_segments = None
+        if document_list is not None:
+            if document_list.shape != (b, s):
+                raise ValueError(
+                    f"document_list must have shape {(b, s)}, got {tuple(document_list.shape)}"
+                )
+            if document_list.device != q_proxy.device:
+                raise ValueError("document_list must be on the same device as attention inputs")
+            document_segments = build_document_segment_metadata(document_list)
+        elif cu_seqlens is not None:
+            if cu_seqlens.device != q_proxy.device:
+                raise ValueError("cu_seqlens must be on the same device as attention inputs")
+            document_segments = build_document_segment_metadata_from_cu_seqlens(
+                cu_seqlens,
+                batch_size=b,
+                seq_len=s,
+            )
         block_indices = select_blocks(
             q_proxy,
             k_proxy,
             scale=float(scale),
             num_blocks=num_blocks,
             top_k_blocks=top_k_blocks,
+            document_segments=document_segments,
         )
 
         main_per_proxy = int(n_heads) // int(n_proxy_heads)
@@ -156,9 +271,17 @@ class _SparseAttentionFunction(torch.autograd.Function):
                 "Main q heads / proxy q heads ratio must divide "
                 "NATIVE_MMA_ROWS_PER_TASK evenly"
             )
+        forward_backend = os.environ.get("MSA_FORWARD_BACKEND", "sm90").lower()
+        default_remote_query_chunk = 512 if forward_backend == "sm90" else 1024
         metadata = build_sparse_attention_metadata_cuda(
             block_indices,
             backward_query_chunk=NATIVE_MMA_ROWS_PER_TASK // main_per_proxy,
+            remote_query_chunk=int(
+                os.environ.get(
+                    "MSA_REMOTE_QUERY_CHUNK", str(default_remote_query_chunk)
+                )
+            ),
+            document_segments=document_segments,
         )
 
         o_main, lse_main, kl_loss = run_main_forward(
@@ -167,11 +290,12 @@ class _SparseAttentionFunction(torch.autograd.Function):
             v,
             scale=float(scale),
             metadata=metadata,
+            prequantized_qkv=prequantized_qkv,
         )
 
         out = o_main.transpose(1, 2).reshape(b, s, -1)
 
-        save_tensors = (
+        save_tensors: tuple[torch.Tensor, ...] = (
             q_proxy,
             k_proxy,
             q,
@@ -186,10 +310,27 @@ class _SparseAttentionFunction(torch.autograd.Function):
             metadata.packed_qids,
             metadata.destinations,
             metadata.edge_positions,
+            metadata.kv_outer_schedule.row_ptr,
         )
+        if document_segments is not None:
+            save_tensors += (
+                document_segments.starts,
+                document_segments.lengths,
+                document_segments.batches,
+                document_segments.doc_first_segment,
+                document_segments.token_segment_ids,
+                document_segments.cu_seqlens,
+            )
         ctx.save_for_backward(*save_tensors)
+        ctx.has_document_segments = document_segments is not None
+        ctx.full_segments_cpu = (
+            None
+            if document_segments is None
+            else document_segments.full_segments_cpu
+        )
         ctx.scale = float(scale)
         ctx.num_remote_tasks = metadata.num_remote_tasks
+        ctx.num_remote_edges = metadata.kv_outer_schedule.num_edges
         ctx.remote_task_meta_cpu = metadata.remote_task_meta_cpu
         ctx.metadata_shape = (
             metadata.batch,
@@ -202,6 +343,7 @@ class _SparseAttentionFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_out: torch.Tensor | None, grad_kl: torch.Tensor | None):
+        base_tensors = ctx.saved_tensors[:15]
         (
             q_proxy,
             k_proxy,
@@ -217,7 +359,27 @@ class _SparseAttentionFunction(torch.autograd.Function):
             packed_qids,
             destinations,
             edge_positions,
-        ) = ctx.saved_tensors
+            kv_row_ptr,
+        ) = base_tensors
+        document_segments = None
+        if ctx.has_document_segments:
+            (
+                segment_starts,
+                segment_lengths,
+                segment_batches,
+                doc_first_segment,
+                token_segment_ids,
+                segment_cu_seqlens,
+            ) = ctx.saved_tensors[15:]
+            document_segments = DocumentSegmentMetadata(
+                starts=segment_starts,
+                lengths=segment_lengths,
+                batches=segment_batches,
+                doc_first_segment=doc_first_segment,
+                token_segment_ids=token_segment_ids,
+                cu_seqlens=segment_cu_seqlens,
+                full_segments_cpu=ctx.full_segments_cpu,
+            )
         batch, n_proxy_heads, seq_len, top_k_blocks, remote_query_chunk = (
             ctx.metadata_shape
         )
@@ -236,6 +398,23 @@ class _SparseAttentionFunction(torch.autograd.Function):
             seq_len=seq_len,
             top_k_blocks=top_k_blocks,
             remote_query_chunk=remote_query_chunk,
+            document_segments=document_segments,
+            kv_outer_schedule=KVOuterSchedule(
+                row_ptr=kv_row_ptr,
+                query_indices=packed_qids,
+                task_meta=remote_task_meta,
+                task_offsets=remote_task_offsets,
+                destinations=destinations,
+                edge_positions=edge_positions,
+                num_tasks=ctx.num_remote_tasks,
+                num_edges=ctx.num_remote_edges,
+                num_key_units=(
+                    seq_len // 128
+                    if document_segments is None
+                    else document_segments.num_segments
+                ),
+                segmented=document_segments is not None,
+            ),
         )
 
         if grad_out is None:
@@ -259,7 +438,7 @@ class _SparseAttentionFunction(torch.autograd.Function):
             metadata,
             scale=ctx.scale,
         )
-        return dq_proxy, dk_proxy, dq, dk, dv, None, None
+        return dq_proxy, dk_proxy, dq, dk, dv, None, None, None, None, None
 
 
 def sparse_attention(
@@ -270,9 +449,29 @@ def sparse_attention(
     v: torch.Tensor,
     top_k: int,
     scale: float,
+    document_list: torch.Tensor | None = None,
+    *,
+    cu_seqlens: torch.Tensor | None = None,
+    prequantized_qkv: MixedFP8QKV | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return ``(attn_out, kl_loss placeholder)`` for sparse self-attention.
+
+    ``cu_seqlens`` follows FA4's CUDA int32 cumulative-offset convention and
+    indexes the flattened ``B * S`` token dimension. It is mutually exclusive
+    with ``document_list``. Flash-MSA still expects Q/K/V tensors in ``B,H,S,D``
+    layout, so the offsets must include every batch-row boundary. Q/K are
+    already projected inputs; callers remain responsible for resetting RoPE at
+    each cumulative document boundary.
     """
-    Return (attn_out, kl_loss placeholder)
-    Saves reverse-index metadata and main attention state for backward.
-    """
-    return _SparseAttentionFunction.apply(q_proxy, k_proxy, q, k, v, int(top_k), float(scale))
+    return _SparseAttentionFunction.apply(
+        q_proxy,
+        k_proxy,
+        q,
+        k,
+        v,
+        int(top_k),
+        float(scale),
+        document_list,
+        cu_seqlens,
+        prequantized_qkv,
+    )

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import torch
 
+from flash_msa.msa_kv_fp8 import MixedFP8QKV
 from flash_msa.reverse_index_cuda import SparseAttentionMetadata
 from flash_msa.sparse_flash_varlen import sparse_flash_varlen_forward
 
@@ -34,6 +35,7 @@ def run_main_forward(
     *,
     scale: float,
     metadata: SparseAttentionMetadata,
+    prequantized_qkv: MixedFP8QKV | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Run varlen selected attention and return its forward outputs."""
 
@@ -64,6 +66,7 @@ def run_main_forward(
         metadata=metadata,
         scale=float(scale),
         return_output=True,
+        prequantized_qkv=prequantized_qkv,
     )
     assert o_main is not None
     kl_loss = torch.zeros((), dtype=torch.float32, device=q.device)

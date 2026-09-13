@@ -9,6 +9,7 @@ The fused MMA kernel recomputes per-tile probabilities, forms main/proxy
 
 import inspect
 import os
+from typing import Optional
 
 import cutlass
 import torch
@@ -18,6 +19,8 @@ from cutlass._mlir.dialects import nvvm
 from cutlass.cute.nvgpu import warp
 from cutlass.cute.runtime import from_dlpack
 from cutlass.cutlass_dsl import T, dsl_user_op
+
+from flash_msa.reverse_index_cuda import DocumentSegmentMetadata
 
 BLOCK_SIZE = 128
 KEY_SLICE_SIZE = 64
@@ -32,7 +35,10 @@ def _to_cute_tensor(tensor: torch.Tensor) -> cute.Tensor:
 
 
 def _derive_head_tiling(
-    n_heads: int, n_kv_heads: int, n_proxy_heads: int
+    n_heads: int,
+    n_kv_heads: int,
+    n_proxy_heads: int,
+    mma_rows_per_task: int = MMA_ROWS_PER_TASK,
 ) -> tuple[int, int, int, int]:
     """Return ``(main_per_proxy, query_chunk, rows_per_task, proxy_query_rows)``."""
 
@@ -46,14 +52,14 @@ def _derive_head_tiling(
         )
 
     main_per_proxy = int(n_heads) // int(n_proxy_heads)
-    if main_per_proxy <= 0 or MMA_ROWS_PER_TASK % main_per_proxy != 0:
+    if main_per_proxy <= 0 or mma_rows_per_task % main_per_proxy != 0:
         raise NotImplementedError(
-            f"main heads per proxy must divide {MMA_ROWS_PER_TASK}, got {main_per_proxy}"
+            f"main heads per proxy must divide {mma_rows_per_task}, got {main_per_proxy}"
         )
 
-    query_chunk = MMA_ROWS_PER_TASK // main_per_proxy
+    query_chunk = mma_rows_per_task // main_per_proxy
     proxy_query_rows = max(32, query_chunk)
-    return main_per_proxy, query_chunk, MMA_ROWS_PER_TASK, proxy_query_rows
+    return main_per_proxy, query_chunk, mma_rows_per_task, proxy_query_rows
 
 
 @dsl_user_op
@@ -117,12 +123,15 @@ class _MSAFusedBackwardMMAKernel:
         head_dim: int,
         num_tasks: int,
         input_query_chunk: int,
+        use_document_segments: bool = False,
+        proxy_only: bool = False,
+        mma_rows_per_task: int = MMA_ROWS_PER_TASK,
         num_threads: int = 256,
     ) -> None:
         if head_dim != 128:
             raise NotImplementedError(f"fused backward requires D=128, got {head_dim}")
         main_per_proxy, query_chunk, rows_per_task, proxy_query_rows = _derive_head_tiling(
-            int(n_heads), int(n_kv_heads), int(n_proxy_heads)
+            int(n_heads), int(n_kv_heads), int(n_proxy_heads), int(mma_rows_per_task)
         )
 
         self.head_dim = int(head_dim)
@@ -134,6 +143,8 @@ class _MSAFusedBackwardMMAKernel:
         self.proxy_heads_per_kv = int(n_proxy_heads) // int(n_kv_heads)
         self.proxy_groups = int(n_proxy_heads) // int(n_proxy_kv_heads)
         self.input_query_chunk = int(input_query_chunk)
+        self.use_document_segments = bool(use_document_segments)
+        self.proxy_only = bool(proxy_only)
         if self.input_query_chunk % query_chunk != 0:
             raise NotImplementedError(
                 "fused backward input task query width must be divisible by "
@@ -157,6 +168,8 @@ class _MSAFusedBackwardMMAKernel:
         delta_main: cute.Tensor,
         task_meta: cute.Tensor,
         task_qids: cute.Tensor,
+        segment_starts: Optional[cute.Tensor],
+        segment_lengths: Optional[cute.Tensor],
         dq_proxy: cute.Tensor,
         dk_proxy: cute.Tensor,
         dq: cute.Tensor,
@@ -206,22 +219,26 @@ class _MSAFusedBackwardMMAKernel:
             s_layout_atom, (self.proxy_query_rows, KEY_SLICE_SIZE), (0, 1)
         )
 
-        @cute.struct
-        class SharedStorage:
-            sQ: cute.struct.Align[cute.struct.MemRange[self._dtype, cute.cosize(sQ_layout)], 1024]
-            sdO: cute.struct.Align[cute.struct.MemRange[self._dtype, cute.cosize(sQ_layout)], 1024]
-            sK: cute.struct.Align[cute.struct.MemRange[self._dtype, cute.cosize(sKV_layout)], 1024]
-            sV: cute.struct.Align[cute.struct.MemRange[self._dtype, cute.cosize(sKV_layout)], 1024]
-            sP: cute.struct.Align[cute.struct.MemRange[self._dtype, cute.cosize(sPdS_layout)], 1024]
-            sdS: cute.struct.Align[
-                cute.struct.MemRange[self._dtype, cute.cosize(sPdS_layout)], 1024
-            ]
-            sQpx: cute.struct.Align[
-                cute.struct.MemRange[self._dtype, cute.cosize(sQpx_layout)], 1024
-            ]
-            sKpx: cute.struct.Align[
-                cute.struct.MemRange[self._dtype, cute.cosize(sKV_layout)], 1024
-            ]
+        if cutlass.const_expr(self.proxy_only):
+            @cute.struct
+            class SharedStorage:
+                sQ: cute.struct.Align[cute.struct.MemRange[self._dtype, cute.cosize(sQ_layout)], 1024]
+                sK: cute.struct.Align[cute.struct.MemRange[self._dtype, cute.cosize(sKV_layout)], 1024]
+                sP: cute.struct.Align[cute.struct.MemRange[self._dtype, cute.cosize(sPdS_layout)], 1024]
+                sQpx: cute.struct.Align[cute.struct.MemRange[self._dtype, cute.cosize(sQpx_layout)], 1024]
+                sKpx: cute.struct.Align[cute.struct.MemRange[self._dtype, cute.cosize(sKV_layout)], 1024]
+                sdSpx: cute.struct.Align[cute.struct.MemRange[self._dtype, cute.cosize(sPdSpx_layout)], 1024]
+        else:
+            @cute.struct
+            class SharedStorage:
+                sQ: cute.struct.Align[cute.struct.MemRange[self._dtype, cute.cosize(sQ_layout)], 1024]
+                sdO: cute.struct.Align[cute.struct.MemRange[self._dtype, cute.cosize(sQ_layout)], 1024]
+                sK: cute.struct.Align[cute.struct.MemRange[self._dtype, cute.cosize(sKV_layout)], 1024]
+                sV: cute.struct.Align[cute.struct.MemRange[self._dtype, cute.cosize(sKV_layout)], 1024]
+                sP: cute.struct.Align[cute.struct.MemRange[self._dtype, cute.cosize(sPdS_layout)], 1024]
+                sdS: cute.struct.Align[cute.struct.MemRange[self._dtype, cute.cosize(sPdS_layout)], 1024]
+                sQpx: cute.struct.Align[cute.struct.MemRange[self._dtype, cute.cosize(sQpx_layout)], 1024]
+                sKpx: cute.struct.Align[cute.struct.MemRange[self._dtype, cute.cosize(sKV_layout)], 1024]
 
         mma_warps = self.num_threads // 32
         mma_m_warps = min(mma_warps, max(1, self.rows_per_task // 16))
@@ -260,6 +277,8 @@ class _MSAFusedBackwardMMAKernel:
             delta_main,
             task_meta,
             task_qids,
+            segment_starts,
+            segment_lengths,
             dq_proxy,
             dk_proxy,
             dq,
@@ -295,6 +314,8 @@ class _MSAFusedBackwardMMAKernel:
         delta_main: cute.Tensor,
         task_meta: cute.Tensor,
         task_qids: cute.Tensor,
+        segment_starts: Optional[cute.Tensor],
+        segment_lengths: Optional[cute.Tensor],
         dq_proxy: cute.Tensor,
         dk_proxy: cute.Tensor,
         dq: cute.Tensor,
@@ -324,6 +345,11 @@ class _MSAFusedBackwardMMAKernel:
         batch = task_meta[task_idx, 0]
         proxy_head = task_meta[task_idx, 1]
         key_block = task_meta[task_idx, 2]
+        key_start = key_block * Int32(BLOCK_SIZE)
+        key_count = Int32(BLOCK_SIZE)
+        if cutlass.const_expr(self.use_document_segments):
+            key_start = segment_starts[key_block]
+            key_count = segment_lengths[key_block]
         query_count = cutlass.min(Int32(self.query_chunk), task_meta[task_idx, 3] - qid_base)
         kv_head = proxy_head // Int32(self.proxy_heads_per_kv)
         proxy_kv_head = proxy_head // Int32(self.proxy_groups)
@@ -331,19 +357,24 @@ class _MSAFusedBackwardMMAKernel:
         smem = cutlass.utils.SmemAllocator()
         storage = smem.allocate(SharedStorage)
         sQ = storage.sQ.get_tensor(sQ_layout)
-        sdO = storage.sdO.get_tensor(sQ_layout)
         sK = storage.sK.get_tensor(sKV_layout)
-        sV = storage.sV.get_tensor(sKV_layout)
         sP = storage.sP.get_tensor(sPdS_layout)
-        sdS = storage.sdS.get_tensor(sPdS_layout)
         sQpx = storage.sQpx.get_tensor(sQpx_layout)
         sKpx = storage.sKpx.get_tensor(sKV_layout)
+        if cutlass.const_expr(self.proxy_only):
+            sdSpx = storage.sdSpx.get_tensor(sPdSpx_layout)
+        else:
+            sdO = storage.sdO.get_tensor(sQ_layout)
+            sV = storage.sV.get_tensor(sKV_layout)
+            sdS = storage.sdS.get_tensor(sPdS_layout)
+            sdSpx = cute.make_tensor(sdS.iterator, sPdSpx_layout)
 
         sQt = _transpose_view(sQ)
-        sdOt = _transpose_view(sdO)
         sKt = _transpose_view(sK)
         sPt = _transpose_view(sP)
-        sdSt = _transpose_view(sdS)
+        if cutlass.const_expr(not self.proxy_only):
+            sdOt = _transpose_view(sdO)
+            sdSt = _transpose_view(sdS)
 
         zero = Float32(0.0).to(self._dtype)
 
@@ -371,39 +402,39 @@ class _MSAFusedBackwardMMAKernel:
 
         tSrQ = thr_sdp.make_fragment_A(thr_sdp.partition_A(sQ))
         tSrK = thr_sdp.make_fragment_B(thr_sdp.partition_B(sK))
-        tdPrdO = thr_sdp.make_fragment_A(thr_sdp.partition_A(sdO))
-        tdPrV = thr_sdp.make_fragment_B(thr_sdp.partition_B(sV))
         tSsQ = copy_A_sdp.partition_S(sQ)
         tSsK = copy_B_sdp.partition_S(sK)
-        tdPsdO = copy_A_sdp.partition_S(sdO)
-        tdPsV = copy_B_sdp.partition_S(sV)
         tSrQ_copy = copy_A_sdp.retile(tSrQ)
         tSrK_copy = copy_B_sdp.retile(tSrK)
-        tdPrdO_copy = copy_A_sdp.retile(tdPrdO)
-        tdPrV_copy = copy_B_sdp.retile(tdPrV)
-
-        tdQrdS = thr_dq.make_fragment_A(thr_dq.partition_A(sdS))
-        tdQrK = thr_dq.make_fragment_B(thr_dq.partition_B(sKt))
-        tdQsdS = copy_A_dq.partition_S(sdS)
-        tdQsKt = copy_B_dq.partition_S(sKt)
-        tdQrdS_copy = copy_A_dq.retile(tdQrdS)
-        tdQrK_copy = copy_B_dq.retile(tdQrK)
-
-        tdVrP = thr_dkv.make_fragment_A(thr_dkv.partition_A(sPt))
-        tdVrdO = thr_dkv.make_fragment_B(thr_dkv.partition_B(sdOt))
-        tdKrdS = thr_dkv.make_fragment_A(thr_dkv.partition_A(sdSt))
-        tdKrQ = thr_dkv.make_fragment_B(thr_dkv.partition_B(sQt))
-        tdVsPt = copy_A_dkv.partition_S(sPt)
-        tdVsdOt = copy_B_dkv.partition_S(sdOt)
-        tdKsdSt = copy_A_dkv.partition_S(sdSt)
-        tdKsQt = copy_B_dkv.partition_S(sQt)
-        tdVrP_copy = copy_A_dkv.retile(tdVrP)
-        tdVrdO_copy = copy_B_dkv.retile(tdVrdO)
-        tdKrdS_copy = copy_A_dkv.retile(tdKrdS)
-        tdKrQ_copy = copy_B_dkv.retile(tdKrQ)
+        if cutlass.const_expr(not self.proxy_only):
+            tdPrdO = thr_sdp.make_fragment_A(thr_sdp.partition_A(sdO))
+            tdPrV = thr_sdp.make_fragment_B(thr_sdp.partition_B(sV))
+            tdPsdO = copy_A_sdp.partition_S(sdO)
+            tdPsV = copy_B_sdp.partition_S(sV)
+            tdPrdO_copy = copy_A_sdp.retile(tdPrdO)
+            tdPrV_copy = copy_B_sdp.retile(tdPrV)
+            tdQrdS = thr_dq.make_fragment_A(thr_dq.partition_A(sdS))
+            tdQrK = thr_dq.make_fragment_B(thr_dq.partition_B(sKt))
+            tdQsdS = copy_A_dq.partition_S(sdS)
+            tdQsKt = copy_B_dq.partition_S(sKt)
+            tdQrdS_copy = copy_A_dq.retile(tdQrdS)
+            tdQrK_copy = copy_B_dq.retile(tdQrK)
+            tdVrP = thr_dkv.make_fragment_A(thr_dkv.partition_A(sPt))
+            tdVrdO = thr_dkv.make_fragment_B(thr_dkv.partition_B(sdOt))
+            tdKrdS = thr_dkv.make_fragment_A(thr_dkv.partition_A(sdSt))
+            tdKrQ = thr_dkv.make_fragment_B(thr_dkv.partition_B(sQt))
+            tdVsPt = copy_A_dkv.partition_S(sPt)
+            tdVsdOt = copy_B_dkv.partition_S(sdOt)
+            tdKsdSt = copy_A_dkv.partition_S(sdSt)
+            tdKsQt = copy_B_dkv.partition_S(sQt)
+            tdVrP_copy = copy_A_dkv.retile(tdVrP)
+            tdVrdO_copy = copy_B_dkv.retile(tdVrdO)
+            tdKrdS_copy = copy_A_dkv.retile(tdKrdS)
+            tdKrQ_copy = copy_B_dkv.retile(tdKrQ)
 
         tPsP = r2s_sdp.partition_D(sP)
-        tdSsdS = r2s_sdp.partition_D(sdS)
+        if cutlass.const_expr(not self.proxy_only):
+            tdSsdS = r2s_sdp.partition_D(sdS)
 
         cS = cute.make_identity_tensor((self.rows_per_task, KEY_SLICE_SIZE))
         tScS_mn = _make_acc_tensor_mn_view(thr_sdp.partition_C(cS))
@@ -417,9 +448,16 @@ class _MSAFusedBackwardMMAKernel:
             while kv_linear < Int32(KEY_SLICE_SIZE * self.head_dim):
                 row = kv_linear // Int32(self.head_dim)
                 dim = kv_linear - row * Int32(self.head_dim)
-                key_pos = key_block * Int32(BLOCK_SIZE) + Int32(key_slice * KEY_SLICE_SIZE) + row
-                sK[row, dim] = k[batch, kv_head, key_pos, dim]
-                sV[row, dim] = v[batch, kv_head, key_pos, dim]
+                key_offset = Int32(key_slice * KEY_SLICE_SIZE) + row
+                if key_offset < key_count:
+                    key_pos = key_start + key_offset
+                    sK[row, dim] = k[batch, kv_head, key_pos, dim]
+                    if cutlass.const_expr(not self.proxy_only):
+                        sV[row, dim] = v[batch, kv_head, key_pos, dim]
+                else:
+                    sK[row, dim] = zero
+                    if cutlass.const_expr(not self.proxy_only):
+                        sV[row, dim] = zero
                 kv_linear += Int32(self.num_threads)
 
             if grad_kl_scale != Float32(0.0):
@@ -427,10 +465,12 @@ class _MSAFusedBackwardMMAKernel:
                 while px_k_linear < Int32(KEY_SLICE_SIZE * self.head_dim):
                     row = px_k_linear // Int32(self.head_dim)
                     dim = px_k_linear - row * Int32(self.head_dim)
-                    key_pos = (
-                        key_block * Int32(BLOCK_SIZE) + Int32(key_slice * KEY_SLICE_SIZE) + row
-                    )
-                    sKpx[row, dim] = k_proxy[batch, proxy_kv_head, key_pos, dim]
+                    key_offset = Int32(key_slice * KEY_SLICE_SIZE) + row
+                    if key_offset < key_count:
+                        key_pos = key_start + key_offset
+                        sKpx[row, dim] = k_proxy[batch, proxy_kv_head, key_pos, dim]
+                    else:
+                        sKpx[row, dim] = zero
                     px_k_linear += Int32(self.num_threads)
 
             cute.arch.sync_threads()
@@ -445,10 +485,12 @@ class _MSAFusedBackwardMMAKernel:
                     q_pos = task_qids[task_idx, qid_base + q_slot]
                     head = proxy_head * Int32(self.main_per_proxy) + head_offset
                     sQ[row, dim] = q[batch, head, q_pos, dim]
-                    sdO[row, dim] = grad_o_main[batch, head, q_pos, dim]
+                    if cutlass.const_expr(not self.proxy_only):
+                        sdO[row, dim] = grad_o_main[batch, head, q_pos, dim]
                 else:
                     sQ[row, dim] = zero
-                    sdO[row, dim] = zero
+                    if cutlass.const_expr(not self.proxy_only):
+                        sdO[row, dim] = zero
                 q_linear += Int32(self.num_threads)
 
             cute.arch.sync_threads()
@@ -463,12 +505,14 @@ class _MSAFusedBackwardMMAKernel:
 
             acc_dP = cute.make_rmem_tensor(acc_shape_S, cutlass.Float32)
             acc_dP.fill(0.0)
-            for kk in cutlass.range_constexpr(cute.size(tdPsdO.shape[2])):
-                cute.copy(copy_A_sdp, tdPsdO[None, None, kk], tdPrdO_copy[None, None, kk])
-                cute.copy(copy_B_sdp, tdPsV[None, None, kk], tdPrV_copy[None, None, kk])
-                cute.gemm(
-                    tiled_mma_sdp, acc_dP, tdPrdO[None, None, kk], tdPrV[None, None, kk], acc_dP
-                )
+            if cutlass.const_expr(not self.proxy_only):
+                for kk in cutlass.range_constexpr(cute.size(tdPsdO.shape[2])):
+                    cute.copy(copy_A_sdp, tdPsdO[None, None, kk], tdPrdO_copy[None, None, kk])
+                    cute.copy(copy_B_sdp, tdPsV[None, None, kk], tdPrV_copy[None, None, kk])
+                    cute.gemm(
+                        tiled_mma_sdp, acc_dP, tdPrdO[None, None, kk],
+                        tdPrV[None, None, kk], acc_dP,
+                    )
 
             acc_S_mn = _make_acc_tensor_mn_view(acc_S)
             acc_dP_mn = _make_acc_tensor_mn_view(acc_dP)
@@ -488,89 +532,95 @@ class _MSAFusedBackwardMMAKernel:
 
                 for cc in cutlass.range_constexpr(cute.size(acc_S_mn.shape[1])):
                     col_n = tScS_mn[rr, cc][1]
-                    key_pos = (
-                        key_block * Int32(BLOCK_SIZE) + Int32(key_slice * KEY_SLICE_SIZE) + col_n
-                    )
+                    key_offset = Int32(key_slice * KEY_SLICE_SIZE) + col_n
+                    key_pos = key_start + key_offset
                     p = Float32(0.0)
-                    if row_is_valid and key_pos <= q_pos:
+                    if row_is_valid and key_offset < key_count and key_pos <= q_pos:
                         p = cute.math.exp2(
                             acc_S_mn[rr, cc] * softmax_scale_log2 - lse * log2_e, fastmath=True
                         )
                     acc_S_mn[rr, cc] = p
-                    acc_dP_mn[rr, cc] = p * (acc_dP_mn[rr, cc] - delta)
+                    if cutlass.const_expr(not self.proxy_only):
+                        acc_dP_mn[rr, cc] = p * (acc_dP_mn[rr, cc] - delta)
+                    else:
+                        acc_dP_mn[rr, cc] = Float32(0.0)
 
             rP = cute.make_fragment_like(acc_S, self._dtype)
-            rdS = cute.make_fragment_like(acc_dP, self._dtype)
             rP.store(acc_S.load().to(self._dtype))
-            rdS.store(acc_dP.load().to(self._dtype))
             tPrP = r2s_sdp.retile(rP)
-            tdSrdS = r2s_sdp.retile(rdS)
             cute.copy(r2s_atom, tPrP, tPsP)
-            cute.copy(r2s_atom, tdSrdS, tdSsdS)
+            if cutlass.const_expr(not self.proxy_only):
+                rdS = cute.make_fragment_like(acc_dP, self._dtype)
+                rdS.store(acc_dP.load().to(self._dtype))
+                tdSrdS = r2s_sdp.retile(rdS)
+                cute.copy(r2s_atom, tdSrdS, tdSsdS)
             cute.arch.sync_threads()
 
-            acc_shape_dV = thr_dkv.partition_shape_C((KEY_SLICE_SIZE, self.head_dim_padded))
-            acc_dV = cute.make_rmem_tensor(acc_shape_dV, cutlass.Float32)
-            acc_dV.fill(0.0)
-            for kk in cutlass.range_constexpr(cute.size(tdVsPt.shape[2])):
-                cute.copy(copy_A_dkv, tdVsPt[None, None, kk], tdVrP_copy[None, None, kk])
-                cute.copy(copy_B_dkv, tdVsdOt[None, None, kk], tdVrdO_copy[None, None, kk])
-                cute.gemm(
-                    tiled_mma_dkv, acc_dV, tdVrP[None, None, kk], tdVrdO[None, None, kk], acc_dV
+            if cutlass.const_expr(not self.proxy_only):
+                acc_shape_dV = thr_dkv.partition_shape_C((KEY_SLICE_SIZE, self.head_dim_padded))
+                acc_dV = cute.make_rmem_tensor(acc_shape_dV, cutlass.Float32)
+                acc_dV.fill(0.0)
+                for kk in cutlass.range_constexpr(cute.size(tdVsPt.shape[2])):
+                    cute.copy(copy_A_dkv, tdVsPt[None, None, kk], tdVrP_copy[None, None, kk])
+                    cute.copy(copy_B_dkv, tdVsdOt[None, None, kk], tdVrdO_copy[None, None, kk])
+                    cute.gemm(
+                        tiled_mma_dkv, acc_dV, tdVrP[None, None, kk], tdVrdO[None, None, kk], acc_dV
+                    )
+                self._atomic_main_kv(
+                    acc_dV,
+                    tKVcKV_mn,
+                    batch,
+                    kv_head,
+                    key_start,
+                    key_count,
+                    Int32(key_slice),
+                    dv,
+                    softmax_scale,
+                    False,
                 )
-            self._atomic_main_kv(
-                acc_dV,
-                tKVcKV_mn,
-                batch,
-                kv_head,
-                key_block,
-                Int32(key_slice),
-                dv,
-                softmax_scale,
-                False,
-            )
 
-            acc_dK = cute.make_rmem_tensor(acc_shape_dV, cutlass.Float32)
-            acc_dK.fill(0.0)
-            for kk in cutlass.range_constexpr(cute.size(tdKsdSt.shape[2])):
-                cute.copy(copy_A_dkv, tdKsdSt[None, None, kk], tdKrdS_copy[None, None, kk])
-                cute.copy(copy_B_dkv, tdKsQt[None, None, kk], tdKrQ_copy[None, None, kk])
-                cute.gemm(
-                    tiled_mma_dkv, acc_dK, tdKrdS[None, None, kk], tdKrQ[None, None, kk], acc_dK
+                acc_dK = cute.make_rmem_tensor(acc_shape_dV, cutlass.Float32)
+                acc_dK.fill(0.0)
+                for kk in cutlass.range_constexpr(cute.size(tdKsdSt.shape[2])):
+                    cute.copy(copy_A_dkv, tdKsdSt[None, None, kk], tdKrdS_copy[None, None, kk])
+                    cute.copy(copy_B_dkv, tdKsQt[None, None, kk], tdKrQ_copy[None, None, kk])
+                    cute.gemm(
+                        tiled_mma_dkv, acc_dK, tdKrdS[None, None, kk], tdKrQ[None, None, kk], acc_dK
+                    )
+                self._atomic_main_kv(
+                    acc_dK,
+                    tKVcKV_mn,
+                    batch,
+                    kv_head,
+                    key_start,
+                    key_count,
+                    Int32(key_slice),
+                    dk,
+                    softmax_scale,
+                    True,
                 )
-            self._atomic_main_kv(
-                acc_dK,
-                tKVcKV_mn,
-                batch,
-                kv_head,
-                key_block,
-                Int32(key_slice),
-                dk,
-                softmax_scale,
-                True,
-            )
 
-            acc_shape_dQ = thr_dq.partition_shape_C((self.rows_per_task, self.head_dim_padded))
-            acc_dQ = cute.make_rmem_tensor(acc_shape_dQ, cutlass.Float32)
-            acc_dQ.fill(0.0)
-            for kk in cutlass.range_constexpr(cute.size(tdQsdS.shape[2])):
-                cute.copy(copy_A_dq, tdQsdS[None, None, kk], tdQrdS_copy[None, None, kk])
-                cute.copy(copy_B_dq, tdQsKt[None, None, kk], tdQrK_copy[None, None, kk])
-                cute.gemm(
-                    tiled_mma_dq, acc_dQ, tdQrdS[None, None, kk], tdQrK[None, None, kk], acc_dQ
+                acc_shape_dQ = thr_dq.partition_shape_C((self.rows_per_task, self.head_dim_padded))
+                acc_dQ = cute.make_rmem_tensor(acc_shape_dQ, cutlass.Float32)
+                acc_dQ.fill(0.0)
+                for kk in cutlass.range_constexpr(cute.size(tdQsdS.shape[2])):
+                    cute.copy(copy_A_dq, tdQsdS[None, None, kk], tdQrdS_copy[None, None, kk])
+                    cute.copy(copy_B_dq, tdQsKt[None, None, kk], tdQrK_copy[None, None, kk])
+                    cute.gemm(
+                        tiled_mma_dq, acc_dQ, tdQrdS[None, None, kk], tdQrK[None, None, kk], acc_dQ
+                    )
+                self._atomic_main_dq(
+                    acc_dQ,
+                    tDqcDq_mn,
+                    batch,
+                    proxy_head,
+                    query_count,
+                    task_idx,
+                    qid_base,
+                    task_qids,
+                    dq,
+                    softmax_scale,
                 )
-            self._atomic_main_dq(
-                acc_dQ,
-                tDqcDq_mn,
-                batch,
-                proxy_head,
-                query_count,
-                task_idx,
-                qid_base,
-                task_qids,
-                dq,
-                softmax_scale,
-            )
 
             if grad_kl_scale != Float32(0.0):
                 thr_px = tiled_mma_px.get_slice(tidx)
@@ -580,7 +630,6 @@ class _MSAFusedBackwardMMAKernel:
                 copy_B_px_dkv = cute.make_tiled_copy_B(copy_atom_t, tiled_mma_px).get_slice(tidx)
                 r2s_px = cute.make_tiled_copy_C(r2s_atom, tiled_mma_px).get_slice(tidx)
 
-                sdSpx = cute.make_tensor(sdS.iterator, sPdSpx_layout)
                 sKpxt = _transpose_view(sKpx)
                 sQpxt = _transpose_view(sQpx)
                 sdSpxt = _transpose_view(sdSpx)
@@ -648,14 +697,11 @@ class _MSAFusedBackwardMMAKernel:
                         lse_px = lse_proxy[batch, proxy_head, q_pos]
                     for cc in cutlass.range_constexpr(cute.size(acc_Px_mn.shape[1])):
                         col_n = tPxcS_mn[rr, cc][1]
-                        key_pos = (
-                            key_block * Int32(BLOCK_SIZE)
-                            + Int32(key_slice * KEY_SLICE_SIZE)
-                            + col_n
-                        )
+                        key_offset = Int32(key_slice * KEY_SLICE_SIZE) + col_n
+                        key_pos = key_start + key_offset
                         # HERE IS THE KL LOSS SURROGATE
                         ds_px = Float32(0.0)
-                        if row_is_valid and key_pos <= q_pos:
+                        if row_is_valid and key_offset < key_count and key_pos <= q_pos:
                             p_px = cute.math.exp2(
                                 acc_Px_mn[rr, cc] * softmax_scale_log2 - lse_px * log2_e,
                                 fastmath=True,
@@ -726,7 +772,8 @@ class _MSAFusedBackwardMMAKernel:
                     tPxcDK_mn,
                     batch,
                     proxy_kv_head,
-                    key_block,
+                    key_start,
+                    key_count,
                     Int32(key_slice),
                     dk_proxy,
                     softmax_scale,
@@ -769,7 +816,8 @@ class _MSAFusedBackwardMMAKernel:
         coord_mn: cute.Tensor,
         batch: Int32,
         kv_head: Int32,
-        key_block: Int32,
+        key_start: Int32,
+        key_count: Int32,
         key_slice: Int32,
         target: cute.Tensor,
         softmax_scale: cutlass.Float32,
@@ -778,13 +826,15 @@ class _MSAFusedBackwardMMAKernel:
         acc_mn = _make_acc_tensor_mn_view(acc)
         for rr in cutlass.range_constexpr(cute.size(acc_mn.shape[0])):
             key_row = coord_mn[rr, 0][0]
-            key_pos = key_block * Int32(BLOCK_SIZE) + key_slice * Int32(KEY_SLICE_SIZE) + key_row
-            for cc in cutlass.range_constexpr(cute.size(acc_mn.shape[1])):
-                dim = coord_mn[rr, cc][1]
-                value = acc_mn[rr, cc]
-                if cutlass.const_expr(apply_scale):
-                    value = value * softmax_scale
-                _atomic_add_fp32(value, _elem_pointer(target, (batch, kv_head, key_pos, dim)))
+            key_offset = key_slice * Int32(KEY_SLICE_SIZE) + key_row
+            if key_offset < key_count:
+                key_pos = key_start + key_offset
+                for cc in cutlass.range_constexpr(cute.size(acc_mn.shape[1])):
+                    dim = coord_mn[rr, cc][1]
+                    value = acc_mn[rr, cc]
+                    if cutlass.const_expr(apply_scale):
+                        value = value * softmax_scale
+                    _atomic_add_fp32(value, _elem_pointer(target, (batch, kv_head, key_pos, dim)))
 
     @cute.jit
     def _atomic_proxy_dq(
@@ -819,7 +869,8 @@ class _MSAFusedBackwardMMAKernel:
         coord_mn: cute.Tensor,
         batch: Int32,
         proxy_kv_head: Int32,
-        key_block: Int32,
+        key_start: Int32,
+        key_count: Int32,
         key_slice: Int32,
         dk_proxy: cute.Tensor,
         softmax_scale: cutlass.Float32,
@@ -827,13 +878,15 @@ class _MSAFusedBackwardMMAKernel:
         acc_mn = _make_acc_tensor_mn_view(acc_dk)
         for rr in cutlass.range_constexpr(cute.size(acc_mn.shape[0])):
             key_row = coord_mn[rr, 0][0]
-            key_pos = key_block * Int32(BLOCK_SIZE) + key_slice * Int32(KEY_SLICE_SIZE) + key_row
-            for cc in cutlass.range_constexpr(cute.size(acc_mn.shape[1])):
-                dim = coord_mn[rr, cc][1]
-                _atomic_add_fp32(
-                    acc_mn[rr, cc] * softmax_scale,
-                    _elem_pointer(dk_proxy, (batch, proxy_kv_head, key_pos, dim)),
-                )
+            key_offset = key_slice * Int32(KEY_SLICE_SIZE) + key_row
+            if key_offset < key_count:
+                key_pos = key_start + key_offset
+                for cc in cutlass.range_constexpr(cute.size(acc_mn.shape[1])):
+                    dim = coord_mn[rr, cc][1]
+                    _atomic_add_fp32(
+                        acc_mn[rr, cc] * softmax_scale,
+                        _elem_pointer(dk_proxy, (batch, proxy_kv_head, key_pos, dim)),
+                    )
 
 
 def _compile_fused_backward_kernel(
@@ -857,6 +910,10 @@ def _compile_fused_backward_kernel(
     delta_main: cute.Tensor,
     task_meta: cute.Tensor,
     task_qids: cute.Tensor,
+    segment_starts: Optional[cute.Tensor],
+    segment_lengths: Optional[cute.Tensor],
+    use_document_segments: bool,
+    proxy_only: bool,
     dq_proxy: cute.Tensor,
     dk_proxy: cute.Tensor,
     dq: cute.Tensor,
@@ -867,8 +924,9 @@ def _compile_fused_backward_kernel(
     stream: cuda.CUstream,
 ):
     num_threads = 256
+    mma_rows_per_task = 128 if proxy_only else MMA_ROWS_PER_TASK
     main_per_proxy, query_chunk, rows_per_task, proxy_query_rows = _derive_head_tiling(
-        n_heads, n_kv_heads, n_proxy_heads
+        n_heads, n_kv_heads, n_proxy_heads, mma_rows_per_task
     )
     key = (
         "fused",
@@ -885,6 +943,8 @@ def _compile_fused_backward_kernel(
         int(head_dim),
         int(num_tasks),
         int(input_query_chunk),
+        bool(use_document_segments),
+        bool(proxy_only),
         int(num_threads),
         q_proxy.element_type,
         k_proxy.element_type,
@@ -914,6 +974,9 @@ def _compile_fused_backward_kernel(
             head_dim=head_dim,
             num_tasks=num_tasks,
             input_query_chunk=input_query_chunk,
+            use_document_segments=use_document_segments,
+            proxy_only=proxy_only,
+            mma_rows_per_task=mma_rows_per_task,
             num_threads=num_threads,
         )
         _COMPILE_CACHE[key] = cute.compile(
@@ -929,6 +992,8 @@ def _compile_fused_backward_kernel(
             delta_main,
             task_meta,
             task_qids,
+            segment_starts,
+            segment_lengths,
             dq_proxy,
             dk_proxy,
             dq,
@@ -957,6 +1022,8 @@ def _run_fused_backward_impl(
     scale: float,
     grad_kl_scale: float,
     cast_outputs: bool = True,
+    document_segments: DocumentSegmentMetadata | None = None,
+    proxy_only: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     if q.device.type != "cuda":
         raise ValueError("CuTeDSL fused backward requires CUDA tensors")
@@ -983,8 +1050,9 @@ def _run_fused_backward_impl(
 
     if head_dim != 128:
         raise NotImplementedError("fused backward supports only D=128")
+    mma_rows_per_task = 128 if proxy_only else MMA_ROWS_PER_TASK
     _main_per_proxy, query_chunk, _rows_per_task, _proxy_query_rows = _derive_head_tiling(
-        n_heads, n_kv_heads, n_proxy_heads
+        n_heads, n_kv_heads, n_proxy_heads, mma_rows_per_task
     )
     input_query_chunk = int(task_qids_c.shape[1])
     if input_query_chunk < query_chunk or input_query_chunk % query_chunk != 0:
@@ -995,9 +1063,14 @@ def _run_fused_backward_impl(
 
     dq_proxy = torch.zeros_like(q_proxy_c, dtype=torch.float32)
     dk_proxy = torch.zeros_like(k_proxy_c, dtype=torch.float32)
-    dk = torch.zeros_like(k_c, dtype=torch.float32)
-    dv = torch.zeros_like(v_c, dtype=torch.float32)
-    dq = torch.zeros_like(q_c, dtype=torch.float32)
+    if proxy_only:
+        dq = torch.empty(1, device=q_c.device, dtype=torch.float32)
+        dk = torch.empty(1, device=q_c.device, dtype=torch.float32)
+        dv = torch.empty(1, device=q_c.device, dtype=torch.float32)
+    else:
+        dk = torch.zeros_like(k_c, dtype=torch.float32)
+        dv = torch.zeros_like(v_c, dtype=torch.float32)
+        dq = torch.zeros_like(q_c, dtype=torch.float32)
 
     q_proxy_t = _to_cute_tensor(q_proxy_c)
     k_proxy_t = _to_cute_tensor(k_proxy_c)
@@ -1010,6 +1083,11 @@ def _run_fused_backward_impl(
     delta_main_t = _to_cute_tensor(delta_main_c)
     task_meta_t = _to_cute_tensor(task_meta_c)
     task_qids_t = _to_cute_tensor(task_qids_c)
+    segment_starts_t = None
+    segment_lengths_t = None
+    if document_segments is not None:
+        segment_starts_t = _to_cute_tensor(document_segments.starts.contiguous())
+        segment_lengths_t = _to_cute_tensor(document_segments.lengths.contiguous())
     dq_proxy_t = _to_cute_tensor(dq_proxy)
     dk_proxy_t = _to_cute_tensor(dk_proxy)
     dq_t = _to_cute_tensor(dq)
@@ -1038,6 +1116,10 @@ def _run_fused_backward_impl(
         delta_main_t,
         task_meta_t,
         task_qids_t,
+        segment_starts_t,
+        segment_lengths_t,
+        document_segments is not None,
+        bool(proxy_only),
         dq_proxy_t,
         dk_proxy_t,
         dq_t,
@@ -1059,6 +1141,8 @@ def _run_fused_backward_impl(
         delta_main_t,
         task_meta_t,
         task_qids_t,
+        segment_starts_t,
+        segment_lengths_t,
         dq_proxy_t,
         dk_proxy_t,
         dq_t,
@@ -1095,6 +1179,8 @@ def run_fused_backward(
     *,
     scale: float,
     grad_kl_scale: float,
+    document_segments: DocumentSegmentMetadata | None = None,
+    proxy_only: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
 
     return _run_fused_backward_impl(
@@ -1111,4 +1197,6 @@ def run_fused_backward(
         task_qids,
         scale=scale,
         grad_kl_scale=grad_kl_scale,
+        document_segments=document_segments,
+        proxy_only=proxy_only,
     )
