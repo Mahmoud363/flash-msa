@@ -87,6 +87,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--dtype", choices=("bfloat16", "float16"), default="bfloat16")
     parser.add_argument("--kernels", choices=("both", "flash-msa", "flash-attn"), default="both")
+    parser.add_argument(
+        "--include-msa-no-kl",
+        action="store_true",
+        help="Also benchmark Flash-MSA when its proxy KL output is not consumed.",
+    )
     parser.add_argument("--seed", type=int, default=67)
     parser.add_argument("--csv", type=Path, help="Optionally write machine-readable results.")
     return parser.parse_args()
@@ -149,9 +154,12 @@ def output_loss(
     args: argparse.Namespace,
     fa_func: Callable,
 ):
-    if kernel == "flash-msa":
+    if kernel.startswith("flash-msa"):
         output, kl_loss = flash_msa_func(*inputs, top_k, args.head_dim**-0.5)
-        return output, output.float().sum() + kl_loss.float()
+        loss = output.float().sum()
+        if kernel != "flash-msa-no-kl":
+            loss = loss + kl_loss.float()
+        return output, loss
     output = fa_func(*inputs, softmax_scale=args.head_dim**-0.5, causal=True)
     # FA4's CuTe interface returns ``(out, lse)`` even with return_lse=False;
     # FA3 returns the output tensor directly by default.
@@ -283,6 +291,9 @@ def main() -> None:
     top_ks = requested_top_ks(args)
     fa_func = flash_attn_function() if args.kernels != "flash-msa" else None
     kernels = ["flash-msa", "flash-attn"] if args.kernels == "both" else [args.kernels]
+    if args.include_msa_no_kl and "flash-msa-no-kl" not in kernels:
+        insertion = kernels.index("flash-msa") + 1 if "flash-msa" in kernels else 0
+        kernels.insert(insertion, "flash-msa-no-kl")
     properties = torch.cuda.get_device_properties(torch.cuda.current_device())
     print(f"GPU: {properties.name} ({properties.total_memory / GiB:.1f} GiB); dtype={args.dtype}")
     print(f"Heads: Q={args.n_heads}, KV={args.n_kv_heads}, proxy-Q={args.n_proxy_heads}, "
