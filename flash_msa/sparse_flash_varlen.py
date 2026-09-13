@@ -219,7 +219,7 @@ def sparse_flash_varlen_forward(
         output_accum = None
 
     use_sm90_forward = (
-        os.environ.get("MSA_FORWARD_BACKEND", "fa3").lower() == "sm90"
+        os.environ.get("MSA_FORWARD_BACKEND", "sm90").lower() == "sm90"
         and metadata.kv_outer_schedule is not None
     )
     if use_sm90_forward and metadata.num_remote_tasks:

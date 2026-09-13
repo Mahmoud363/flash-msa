@@ -100,7 +100,9 @@ def _run_fused_selected_edge_backward(
     delta_main = (o_main.float() * grad_o_main.float()).sum(dim=-1)
     backward_backend = os.environ.get(
         "MSA_BACKWARD_BACKEND",
-        "sm90" if os.environ.get("MSA_FORWARD_BACKEND", "fa3").lower() == "sm90" else "legacy",
+        "sm90"
+        if os.environ.get("MSA_FORWARD_BACKEND", "sm90").lower() == "sm90"
+        else "legacy",
     ).lower()
     if backward_backend not in ("legacy", "sm90"):
         raise ValueError("MSA_BACKWARD_BACKEND must be 'legacy' or 'sm90'")
@@ -269,7 +271,7 @@ class _SparseAttentionFunction(torch.autograd.Function):
                 "Main q heads / proxy q heads ratio must divide "
                 "NATIVE_MMA_ROWS_PER_TASK evenly"
             )
-        forward_backend = os.environ.get("MSA_FORWARD_BACKEND", "fa3").lower()
+        forward_backend = os.environ.get("MSA_FORWARD_BACKEND", "sm90").lower()
         default_remote_query_chunk = 512 if forward_backend == "sm90" else 1024
         metadata = build_sparse_attention_metadata_cuda(
             block_indices,

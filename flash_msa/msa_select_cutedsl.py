@@ -588,7 +588,7 @@ def select_blocks(
 
     selection_backend = os.environ.get("MSA_SELECT_BACKEND")
     if selection_backend is None:
-        forward_backend = os.environ.get("MSA_FORWARD_BACKEND", "fa3").lower()
+        forward_backend = os.environ.get("MSA_FORWARD_BACKEND", "sm90").lower()
         selection_backend = (
             "fp8"
             if forward_backend == "sm90" and document_segments is None
