@@ -597,7 +597,7 @@ def select_blocks(
     selection_backend = selection_backend.lower()
     if selection_backend not in ("bf16", "fp8"):
         raise ValueError("MSA_SELECT_BACKEND must be 'bf16' or 'fp8'")
-    if selection_backend == "fp8" and document_segments is None:
+    if selection_backend == "fp8":
         if torch.cuda.get_device_capability(q_proxy.device) != (9, 0):
             raise RuntimeError("FP8 proxy selection requires compute capability 9.0")
         from flash_msa.msa_select_fp8 import quantize_proxy_e4m3_per_block_cutedsl
@@ -612,6 +612,7 @@ def select_blocks(
             k_scales,
             scale=float(scale),
             top_k_blocks=int(top_k_blocks),
+            document_segments=document_segments,
         )
 
     q_c = q_proxy.detach().contiguous()

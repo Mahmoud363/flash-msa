@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from typing import Optional
 
 import cutlass
 import torch
@@ -12,6 +13,8 @@ from cutlass.cute.nvgpu import warpgroup
 from cutlass.cute.runtime import from_dlpack
 import cutlass.utils as utils
 import cutlass.utils.hopper_helpers as sm90_utils
+
+from flash_msa.reverse_index_cuda import DocumentSegmentMetadata
 
 
 BLOCK = 128
@@ -39,6 +42,8 @@ class _FP8SelectKernel:
         n_proxy_kv_heads: int,
         seq_len: int,
         top_k_blocks: int,
+        segmented: bool = False,
+        num_segments: int = 0,
     ) -> None:
         self.batch = int(batch)
         self.n_proxy_heads = int(n_proxy_heads)
@@ -47,6 +52,8 @@ class _FP8SelectKernel:
         self.num_blocks = int(seq_len) // BLOCK
         self.num_query_tiles = int(seq_len) // ROWS
         self.top_k_blocks = int(top_k_blocks)
+        self.segmented = bool(segmented)
+        self.num_key_units = int(num_segments) if segmented else self.num_blocks
 
     @staticmethod
     @cute.jit
@@ -149,6 +156,10 @@ class _FP8SelectKernel:
         q_scales: cute.Tensor,
         k_scales: cute.Tensor,
         block_indices: cute.Tensor,
+        token_segment_ids: Optional[cute.Tensor],
+        doc_first_segment: Optional[cute.Tensor],
+        segment_starts: Optional[cute.Tensor],
+        segment_lengths: Optional[cute.Tensor],
         softmax_scale: cutlass.Float32,
         stream: cuda.CUstream,
     ):
@@ -234,6 +245,10 @@ class _FP8SelectKernel:
             q_scales,
             k_scales,
             block_indices,
+            token_segment_ids,
+            doc_first_segment,
+            segment_starts,
+            segment_lengths,
             softmax_scale,
             tiled_mma,
             q_smem_staged,
@@ -255,6 +270,10 @@ class _FP8SelectKernel:
         q_scales: cute.Tensor,
         k_scales: cute.Tensor,
         block_indices: cute.Tensor,
+        token_segment_ids: Optional[cute.Tensor],
+        doc_first_segment: Optional[cute.Tensor],
+        segment_starts: Optional[cute.Tensor],
+        segment_lengths: Optional[cute.Tensor],
         softmax_scale: cutlass.Float32,
         tiled_mma: cute.TiledMma,
         q_smem_staged: cute.ComposedLayout,
@@ -268,6 +287,11 @@ class _FP8SelectKernel:
         query_block = query_start // Int32(BLOCK)
         proxy_kv_head = proxy_head // Int32(self.proxy_groups)
         key_end = query_block + Int32(1)
+        key_begin = Int32(0)
+        if cutlass.const_expr(self.segmented):
+            first_query_segment = token_segment_ids[batch, query_start]
+            first_document_segment = doc_first_segment[first_query_segment]
+            key_begin = segment_starts[first_document_segment] // Int32(BLOCK)
 
         smem = utils.SmemAllocator()
         storage = smem.allocate(self.shared_storage)
@@ -334,7 +358,7 @@ class _FP8SelectKernel:
                     tma_bar_ptr=q_pipe.producer_get_barrier(q_producer),
                 )
                 q_pipe.producer_commit(q_producer)
-                key_block = Int32(0)
+                key_block = key_begin
                 while key_block < key_end:
                     k_pipe.producer_acquire(k_producer)
                     cute.copy(
@@ -370,8 +394,8 @@ class _FP8SelectKernel:
                 (row_count, self.top_k_blocks), Int32
             )
             top_values.fill(-cutlass.Float32.inf)
-            top_indices.fill(Int32(self.num_blocks))
-            key_block = Int32(0)
+            top_indices.fill(Int32(self.num_key_units))
+            key_block = key_begin
             while key_block < key_end:
                 k_pipe.consumer_wait(k_consumer)
                 accumulator = thr_mma.make_fragment_C(acc_shape)
@@ -384,6 +408,40 @@ class _FP8SelectKernel:
                 )
                 cute.nvgpu.warpgroup.commit_group()
                 cute.nvgpu.warpgroup.wait_group(0)
+                if cutlass.const_expr(self.segmented):
+                    accumulator_mn = cute.make_tensor(
+                        accumulator.iterator,
+                        self._layout_acc_mn(tiled_mma, accumulator.layout),
+                    )
+                    for row in cutlass.range_constexpr(
+                        cute.size(accumulator_mn, mode=[0])
+                    ):
+                        query_offset = coordinates_mn[row, 0][0]
+                        query_position = query_start + query_offset
+                        query_segment = token_segment_ids[batch, query_position]
+                        query_document = doc_first_segment[query_segment]
+                        block_last = cutlass.min(
+                            (key_block + Int32(1)) * Int32(BLOCK) - Int32(1),
+                            Int32(self.seq_len - 1),
+                        )
+                        candidate = token_segment_ids[batch, block_last]
+                        if key_block == query_block:
+                            candidate = query_segment
+                        candidate_start = segment_starts[candidate]
+                        candidate_end = candidate_start + segment_lengths[candidate]
+                        same_document = doc_first_segment[candidate] == query_document
+                        for col in cutlass.range_constexpr(
+                            cute.size(accumulator_mn, mode=[1])
+                        ):
+                            key_offset = coordinates_mn[row, col][1]
+                            key_position = key_block * Int32(BLOCK) + key_offset
+                            if (
+                                not same_document
+                                or key_position < candidate_start
+                                or key_position >= candidate_end
+                                or key_position > query_position
+                            ):
+                                accumulator_mn[row, col] = -cutlass.Float32.inf
                 row_max = self._row_max(accumulator, tiled_mma)
                 score_scale = (
                     softmax_scale
@@ -392,11 +450,31 @@ class _FP8SelectKernel:
                 )
                 for row in cutlass.range_constexpr(cute.size(row_max)):
                     score = row_max[row] * score_scale
-                    if key_block == query_block:
+                    candidate = key_block
+                    valid_candidate = True
+                    if cutlass.const_expr(self.segmented):
+                        query_offset = coordinates_mn[row, 0][0]
+                        query_position = query_start + query_offset
+                        query_segment = token_segment_ids[batch, query_position]
+                        query_document = doc_first_segment[query_segment]
+                        block_last = cutlass.min(
+                            (key_block + Int32(1)) * Int32(BLOCK) - Int32(1),
+                            Int32(self.seq_len - 1),
+                        )
+                        candidate = token_segment_ids[batch, block_last]
+                        if key_block == query_block:
+                            candidate = query_segment
+                        valid_candidate = (
+                            doc_first_segment[candidate] == query_document
+                        )
+                        if candidate == query_segment:
+                            score = cutlass.Float32.inf
+                    elif key_block == query_block:
                         score = cutlass.Float32.inf
-                    self._insert_topk(
-                        top_values, top_indices, row, score, key_block
-                    )
+                    if valid_candidate:
+                        self._insert_topk(
+                            top_values, top_indices, row, score, candidate
+                        )
                 k_pipe.consumer_release(k_consumer)
                 k_consumer.advance()
                 key_block += Int32(1)
@@ -420,6 +498,7 @@ def select_blocks_fp8_sm90(
     *,
     scale: float,
     top_k_blocks: int,
+    document_segments: DocumentSegmentMetadata | None = None,
 ) -> torch.Tensor:
     """Select causal proxy blocks with E4M3 WGMMA and FP32 ranking."""
 
@@ -448,6 +527,20 @@ def select_blocks_fp8_sm90(
     k_c = k_proxy.detach().contiguous()
     q_scale_c = q_scales.detach().contiguous()
     k_scale_c = k_scales.detach().contiguous()
+    segmented = document_segments is not None
+    token_segments_t = None
+    doc_first_t = None
+    segment_starts_t = None
+    segment_lengths_t = None
+    if segmented:
+        token_segments_t = _to_cute_tensor(
+            document_segments.token_segment_ids.contiguous()
+        )
+        doc_first_t = _to_cute_tensor(
+            document_segments.doc_first_segment.contiguous()
+        )
+        segment_starts_t = _to_cute_tensor(document_segments.starts.contiguous())
+        segment_lengths_t = _to_cute_tensor(document_segments.lengths.contiguous())
     output = torch.empty(
         (batch, n_proxy_heads, seq_len, int(top_k_blocks)),
         device=q_proxy.device,
@@ -466,6 +559,8 @@ def select_blocks_fp8_sm90(
         seq_len,
         int(top_k_blocks),
         q_t.element_type,
+        segmented,
+        0 if document_segments is None else document_segments.num_segments,
     )
     if key not in _COMPILE_CACHE:
         kernel = _FP8SelectKernel(
@@ -474,12 +569,37 @@ def select_blocks_fp8_sm90(
             n_proxy_kv_heads=n_proxy_kv_heads,
             seq_len=seq_len,
             top_k_blocks=int(top_k_blocks),
+            segmented=segmented,
+            num_segments=(
+                0 if document_segments is None else document_segments.num_segments
+            ),
         )
         _COMPILE_CACHE[key] = cute.compile(
-            kernel, q_t, k_t, qs_t, ks_t, output_t, float(scale), stream
+            kernel,
+            q_t,
+            k_t,
+            qs_t,
+            ks_t,
+            output_t,
+            token_segments_t,
+            doc_first_t,
+            segment_starts_t,
+            segment_lengths_t,
+            float(scale),
+            stream,
         )
     _COMPILE_CACHE[key](
-        q_t, k_t, qs_t, ks_t, output_t, float(scale), stream
+        q_t,
+        k_t,
+        qs_t,
+        ks_t,
+        output_t,
+        token_segments_t,
+        doc_first_t,
+        segment_starts_t,
+        segment_lengths_t,
+        float(scale),
+        stream,
     )
     return output
 

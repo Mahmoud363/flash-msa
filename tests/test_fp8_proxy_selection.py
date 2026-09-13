@@ -14,6 +14,7 @@ from flash_msa.msa_select_fp8 import (
 )
 from flash_msa.msa_select_cutedsl import select_blocks
 from flash_msa.msa_select_sm90 import select_blocks_fp8_sm90
+from flash_msa.reverse_index_cuda import build_document_segment_metadata
 
 
 def _require_sm90() -> None:
@@ -110,6 +111,47 @@ def test_fused_cutedsl_quantizer_matches_reference_policy() -> None:
     torch.testing.assert_close(
         actual_q.float(), expected_q.float(), rtol=0, atol=0
     )
+
+
+def test_segmented_fp8_selector_matches_dequantized_reference(monkeypatch) -> None:
+    _require_sm90()
+    torch.manual_seed(87)
+    q = torch.randn(2, 4, 512, 128, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(2, 1, 512, 128, device="cuda", dtype=torch.bfloat16)
+    documents = torch.empty(2, 512, device="cuda", dtype=torch.int32)
+    documents[0, :173], documents[0, 173:401], documents[0, 401:] = 0, 1, 2
+    documents[1, :91], documents[1, 91:287], documents[1, 287:] = 0, 1, 2
+    segments = build_document_segment_metadata(documents)
+    q8, q_scale = quantize_proxy_e4m3_per_block_cutedsl(q)
+    k8, k_scale = quantize_proxy_e4m3_per_block_cutedsl(k)
+    q_ref = dequantize_proxy_e4m3_per_block(q8, q_scale, dtype=q.dtype)
+    k_ref = dequantize_proxy_e4m3_per_block(k8, k_scale, dtype=k.dtype)
+    monkeypatch.setenv("MSA_SELECT_BACKEND", "bf16")
+    reference = select_blocks(
+        q_ref,
+        k_ref,
+        scale=128**-0.5,
+        num_blocks=4,
+        top_k_blocks=2,
+        document_segments=segments,
+    )
+    candidate = select_blocks_fp8_sm90(
+        q8,
+        k8,
+        q_scale,
+        k_scale,
+        scale=128**-0.5,
+        top_k_blocks=2,
+        document_segments=segments,
+    )
+    agreement = selection_agreement(reference, candidate)
+    assert agreement.recall_at_k > 0.995
+    local_segments = segments.token_segment_ids[:, None, :, None]
+    assert bool((candidate == local_segments).any(dim=-1).all())
+    valid = candidate < segments.num_segments
+    selected_docs = segments.doc_first_segment[candidate.clamp_max(segments.num_segments - 1)]
+    query_docs = segments.doc_first_segment[local_segments]
+    assert bool((~valid | (selected_docs == query_docs)).all())
 
 
 def test_fp8_training_step_meets_approximate_stability_gates(monkeypatch) -> None:
